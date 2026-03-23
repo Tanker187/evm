@@ -30,6 +30,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	cosmoslog "cosmossdk.io/log/v2"
 	"github.com/cosmos/evm/mempool/internal/heightsync"
 	"github.com/cosmos/evm/mempool/reserver"
 	"github.com/ethereum/go-ethereum/common"
@@ -383,7 +384,7 @@ func WithRecheck(rechecker Rechecker) Option {
 
 // New creates a new transaction pool to gather, sort and filter inbound
 // transactions from the network.
-func New(config Config, chain BlockChain, opts ...Option) *LegacyPool {
+func New(config Config, logger cosmoslog.Logger, chain BlockChain, opts ...Option) *LegacyPool {
 	// Sanitize the input to ensure no vulnerable gas prices are set
 	config = (&config).sanitize()
 
@@ -398,7 +399,7 @@ func New(config Config, chain BlockChain, opts ...Option) *LegacyPool {
 		beats:            make(map[common.Address]time.Time),
 		all:              newLookup(),
 		rechecker:        newNopRechecker(),
-		validPendingTxs:  heightsync.New(chain.CurrentBlock().Number, NewTxStore),
+		validPendingTxs:  heightsync.New(chain.CurrentBlock().Number, NewTxStore, logger.With("pool", "legacypool")),
 		reqResetCh:       make(chan *txpoolResetRequest),
 		reqPromoteCh:     make(chan *accountSet),
 		reqCancelResetCh: make(chan struct{}),
@@ -642,17 +643,82 @@ func (pool *LegacyPool) ContentFrom(addr common.Address) ([]*types.Transaction, 
 	return pending, queued
 }
 
-// Pending retrieves all currently processable transactions, grouped by origin
+// Rechecked retrieves all currently rechecked transactions, grouped by origin
 // account and sorted by nonce.
 //
 // The transactions can also be pre-filtered by the dynamic fee components to
 // reduce allocations and load on downstream subsystems.
-func (pool *LegacyPool) Pending(ctx context.Context, height *big.Int, filter txpool.PendingFilter) map[common.Address][]*txpool.LazyTransaction {
+func (pool *LegacyPool) Rechecked(ctx context.Context, height *big.Int, filter txpool.PendingFilter) map[common.Address][]*txpool.LazyTransaction {
 	txStore := pool.validPendingTxs.GetStore(ctx, height)
 	if txStore == nil {
 		return nil
 	}
 	return txStore.Txs(filter)
+}
+
+// Pending retrieves all currently processable transactions, grouped by origin
+// account and sorted by nonce.
+//
+// The transactions can also be pre-filtered by the dynamic fee components to
+// reduce allocations and load on downstream subsystems.
+func (pool *LegacyPool) Pending(ctx context.Context, filter txpool.PendingFilter) map[common.Address][]*txpool.LazyTransaction {
+	// If only blob transactions are requested, this pool is unsuitable as it
+	// contains none, don't even bother.
+	if filter.OnlyBlobTxs {
+		return nil
+	}
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+
+	// Convert the new uint256.Int types to the old big.Int ones used by the
+	// legacy pool
+	var (
+		minTip  *big.Int
+		baseFee *big.Int
+	)
+	if filter.MinTip != nil {
+		minTip = filter.MinTip.ToBig()
+	}
+	if filter.BaseFee != nil {
+		baseFee = filter.BaseFee.ToBig()
+	}
+
+	pending := make(map[common.Address][]*txpool.LazyTransaction, len(pool.pending))
+	for addr, list := range pool.pending {
+		if lazies := filterAndWrapTxs(list.Flatten(), minTip, baseFee); len(lazies) > 0 {
+			pending[addr] = lazies
+		}
+	}
+	return pending
+}
+
+// filterAndWrapTxs applies tip filtering to txs and wraps the survivors into
+// LazyTransactions.
+func filterAndWrapTxs(txs []*types.Transaction, minTip, baseFee *big.Int) []*txpool.LazyTransaction {
+	if minTip != nil {
+		for i, tx := range txs {
+			if tx.EffectiveGasTipIntCmp(minTip, baseFee) < 0 {
+				txs = txs[:i]
+				break
+			}
+		}
+	}
+	if len(txs) == 0 {
+		return nil
+	}
+	lazies := make([]*txpool.LazyTransaction, len(txs))
+	for i, tx := range txs {
+		lazies[i] = &txpool.LazyTransaction{
+			Hash:      tx.Hash(),
+			Tx:        tx,
+			Time:      tx.Time(),
+			GasFeeCap: uint256.MustFromBig(tx.GasFeeCap()),
+			GasTipCap: uint256.MustFromBig(tx.GasTipCap()),
+			Gas:       tx.Gas(),
+			BlobGas:   tx.BlobGas(),
+		}
+	}
+	return lazies
 }
 
 // ValidateTxBasics checks whether a transaction is valid according to the consensus
