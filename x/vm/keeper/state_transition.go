@@ -400,7 +400,7 @@ func (k *Keeper) ApplyMessageWithConfig(ctx sdk.Context, stateDB *statedb.StateD
 
 	ctx, span := ctx.StartSpan(tracer, "ApplyMessageWithConfig", trace.WithAttributes(
 		attribute.String("hash", txConfig.TxHash.String()),
-		attribute.Int("tx_index", int(txConfig.TxIndex)), //nolint:gosec // G115
+		attribute.Int("tx_index", int(txConfig.TxIndex)),
 		attribute.Bool("commit", commit),
 		attribute.Bool("internal", internal),
 	))
@@ -433,11 +433,13 @@ func (k *Keeper) ApplyMessageWithConfig(ctx sdk.Context, stateDB *statedb.StateD
 	// Allow the tracer captures the tx level events, mainly the gas consumption.
 	vmCfg := evm.Config
 	if vmCfg.Tracer != nil {
-		vmCfg.Tracer.OnTxStart(
-			evm.GetVMContext(),
-			ethtypes.NewTx(&ethtypes.LegacyTx{To: msg.To, Data: msg.Data, Value: msg.Value, Gas: msg.GasLimit}),
-			msg.From,
-		)
+		if vmCfg.Tracer.OnTxStart != nil {
+			vmCfg.Tracer.OnTxStart(
+				evm.GetVMContext(),
+				ethtypes.NewTx(&ethtypes.LegacyTx{To: msg.To, Data: msg.Data, Value: msg.Value, Gas: msg.GasLimit}),
+				msg.From,
+			)
+		}
 		defer func() {
 			if vmCfg.Tracer.OnTxEnd != nil {
 				vmCfg.Tracer.OnTxEnd(&ethtypes.Receipt{GasUsed: msg.GasLimit - leftoverGas}, vmErr)

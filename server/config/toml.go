@@ -66,6 +66,10 @@ check-tx-timeout = "{{ .EVM.Mempool.CheckTxTimeout }}"
 # InsertQueueSize is the maximum number of transactions that can be in the insert queue at once (0 means unbounded)
 insert-queue-size = "{{ .EVM.Mempool.InsertQueueSize }}"
 
+# EnableTxTracker enables per-tx lifecycle telemetry from the mempool
+# (queued/pending/included latencies). Disabled by default.
+enable-tx-tracker = {{ .EVM.Mempool.EnableTxTracker }}
+
 ###############################################################################
 ###                           JSON RPC Configuration                        ###
 ###############################################################################
@@ -101,8 +105,13 @@ evm-timeout = "{{ .JSONRPC.EVMTimeout }}"
 # TxFeeCap is the global tx-fee cap for send transaction. Default: 1eth.
 txfee-cap = {{ .JSONRPC.TxFeeCap }}
 
-# FilterCap sets the global cap for total number of filters that can be created
-filter-cap = {{ .JSONRPC.FilterCap }}
+# FilterTimeout defines when an idle filter expires.
+# Filters are reclaimed via this idle sweep (matching upstream go-ethereum);
+# front the JSON-RPC server with a reverse proxy if you need rate limiting.
+filter-timeout = "{{ .JSONRPC.FilterTimeout }}"
+
+# FilterCleanupInterval defines how often expired filters are cleaned up.
+filter-cleanup-interval = "{{ .JSONRPC.FilterCleanupInterval }}"
 
 # FeeHistoryCap sets the global cap for total number of blocks that can be fetched
 feehistory-cap = {{ .JSONRPC.FeeHistoryCap }}

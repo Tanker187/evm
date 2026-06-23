@@ -51,7 +51,9 @@ import (
 	"github.com/cosmos/evm/mempool/txpool"
 )
 
-// minimal tx encoder to construct a reap list during testing
+// testTxEncoder is a stub for legacypool tests that don't exercise size.
+// CosmosTx returns (nil, nil) — don't reuse for tests that exercise the
+// reaplist's bytes axis.
 type testTxEncoder struct{}
 
 func (testTxEncoder) EVMTx(tx *types.Transaction) ([]byte, error) {
@@ -405,8 +407,8 @@ func TestMarkTxRemovedInvalidatesPendingReplacementFailsRecheck(t *testing.T) {
 	pool, rechecker, key := setupPool()
 	defer pool.Close()
 
-	initialDropped := pendingRecheckDropMeter.Snapshot().Count()
-	initialInvalidated := pendingDemotedRecheck.Snapshot().Count()
+	initialDropped := readCounterTotal(t, "txpool.pending.recheckdrop")
+	initialInvalidated := readCounterTotal(t, "txpool.pending.demoted.recheck")
 
 	addr := crypto.PubkeyToAddress(key.PublicKey)
 	tx4 := pricedTransaction(4, 100000, big.NewInt(1), key)
@@ -464,10 +466,10 @@ func TestMarkTxRemovedInvalidatesPendingReplacementFailsRecheck(t *testing.T) {
 	})
 	require.Nil(t, pool.all.Get(replacement.Hash()))
 
-	dropped := pendingRecheckDropMeter.Snapshot().Count() - initialDropped
+	dropped := readCounterTotal(t, "txpool.pending.recheckdrop") - initialDropped
 	require.Equal(t, int64(1), dropped)
 
-	invalidated := pendingDemotedRecheck.Snapshot().Count() - initialInvalidated
+	invalidated := readCounterTotal(t, "txpool.pending.demoted.recheck") - initialInvalidated
 	require.Equal(t, int64(2), invalidated)
 	pool.mu.RUnlock()
 }
@@ -868,7 +870,7 @@ func TestScheduleForRemoval(t *testing.T) {
 	require.Len(t, pending, 4, "precondition: four pending txs")
 	require.Len(t, queued, 1, "precondition: one queued tx")
 
-	require.NoError(t, pool.ScheduleForRemoval(txs[1]))
+	pool.SetLatestNonce(addr, txs[1].Nonce())
 	<-pool.requestReset(nil, nil)
 
 	pending, queued = pool.ContentFrom(addr)
@@ -877,18 +879,18 @@ func TestScheduleForRemoval(t *testing.T) {
 	require.Equal(t, uint64(3), pending[1].Nonce())
 	require.Len(t, queued, 1, "queued tx@10 is above threshold and survives")
 
-	require.NoError(t, pool.ScheduleForRemoval(txs[0]))
+	pool.SetLatestNonce(addr, txs[0].Nonce())
 	<-pool.requestReset(nil, nil)
 
 	pending, _ = pool.ContentFrom(addr)
 	require.Len(t, pending, 2, "lower-nonce schedule must be a no-op")
 
-	require.NoError(t, pool.ScheduleForRemoval(queuedTx))
+	pool.SetLatestNonce(addr, queuedTx.Nonce())
 	<-pool.requestReset(nil, nil)
 
 	pending, queued = pool.ContentFrom(addr)
-	require.Empty(t, pending, "pending drained by ScheduleForRemoval at nonce 10")
-	require.Empty(t, queued, "queued tx@10 drained by ScheduleForRemoval")
+	require.Empty(t, pending, "pending drained by SetLatestNonce at nonce 10")
+	require.Empty(t, queued, "queued tx@10 drained by SetLatestNonce")
 }
 
 // Tests that if an account runs out of funds, any pending and queued transactions
@@ -2840,6 +2842,104 @@ func TestSetCodeTransactionsReorg(t *testing.T) {
 	}
 }
 
+func TestQueuedPromotionOnReset(t *testing.T) {
+	t.Parallel()
+
+	pool, _, _ := setupPool()
+	defer pool.Close()
+
+	// create transactions with sequential nonces
+	key, _ := crypto.GenerateKey()
+	addr := crypto.PubkeyToAddress(key.PublicKey)
+
+	// mock the on chain nonce for this account as 0
+	testSetNonce(pool, addr, 0)
+	testAddBalance(pool, addr, big.NewInt(1000000000000000))
+
+	// create two txs and add  both transactions to the pool synchronously, so
+	// they will both go to pending
+	tx0 := transaction(0, 100000, key)
+	tx1 := transaction(1, 100000, key)
+	require.NoError(t, pool.addRemoteSync(tx0))
+	require.NoError(t, pool.addRemoteSync(tx1))
+
+	// create another sequential tx based on the previous two, but only enqueue
+	// it
+	tx2 := transaction(2, 100000, key)
+	replaced, err := pool.enqueueTx(tx2.Hash(), tx2, true)
+	require.False(t, replaced, "enqueuing tx should not have replaced anything")
+	require.NoError(t, err)
+
+	// ensure we have 2 txs in pending and 1 in queued
+	pending, queued := pool.Stats()
+	require.Equal(t, 2, pending, "incorrect amount of txs in the pending pool after setup")
+	require.Equal(t, 1, queued, "incorrect amount of txs in queued pool after setup")
+
+	// now we reset the pool to a new height. this reset will trigger a mempool
+	// state reset, plus a promotion of our queued tx to pending
+	oldHead := pool.currentHead.Load()
+	oldHead.BaseFee = big.NewInt(100) // needed for testing
+	newHead := *oldHead
+	newHead.Number = new(big.Int).Add(oldHead.Number, big.NewInt(1))
+	pool.Reset(oldHead, &newHead)
+
+	pending, queued = pool.Stats()
+	require.Equal(t, 3, pending, "incorrect amount of txs in the pending pool after reset")
+	require.Equal(t, 0, queued, "incorrect amount of txs in queued pool after reset")
+}
+
+func TestQueuedPromotionOnResetWithStalePending(t *testing.T) {
+	t.Parallel()
+
+	pool, _, _ := setupPool()
+	defer pool.Close()
+
+	// create transactions with sequential nonces
+	key, _ := crypto.GenerateKey()
+	addr := crypto.PubkeyToAddress(key.PublicKey)
+
+	// mock the on chain nonce for this account as 0
+	testSetNonce(pool, addr, 0)
+	testAddBalance(pool, addr, big.NewInt(1000000000000000))
+
+	// create two txs and add  both transactions to the pool synchronously, so
+	// they will both go to pending
+	tx0 := transaction(0, 100000, key)
+	tx1 := transaction(1, 100000, key)
+	require.NoError(t, pool.addRemoteSync(tx0))
+	require.NoError(t, pool.addRemoteSync(tx1))
+
+	// create another tx with a nonce gap from the previous two, this will stay
+	// enqueued.
+	tx3 := transaction(3, 100000, key)
+	require.NoError(t, pool.addRemoteSync(tx3))
+
+	// ensure we have 2 txs in pending and 1 in queued
+	pending, queued := pool.Stats()
+	require.Equal(t, 2, pending, "incorrect amount of txs in the pending pool after setup")
+	require.Equal(t, 1, queued, "incorrect amount of txs in queued pool after setup")
+
+	// mock that tx0 and tx1 **AND** tx2 were included on chain (simulating
+	// that another node had tx2, and filled the nonce gap for us)
+	pool.SetLatestNonce(addr, tx0.Nonce())
+	pool.SetLatestNonce(addr, tx1.Nonce())
+	tx2 := transaction(2, 100000, key)
+	pool.SetLatestNonce(addr, tx2.Nonce())
+
+	// now we reset the pool to a new height. this reset will trigger a mempool
+	// state reset, plus a promotion of our queued tx to pending, and dropping
+	// the olds txs that were scheduled for removal
+	oldHead := pool.currentHead.Load()
+	oldHead.BaseFee = big.NewInt(100) // needed for testing
+	newHead := *oldHead
+	newHead.Number = new(big.Int).Add(oldHead.Number, big.NewInt(1))
+	pool.Reset(oldHead, &newHead)
+
+	pending, queued = pool.Stats()
+	require.Equal(t, 1, pending, "incorrect amount of txs in the pending pool after reset")
+	require.Equal(t, 0, queued, "incorrect amount of txs in queued pool after reset")
+}
+
 // TestRemoveTxTruncatePoolRace is a regression test for a race condition
 // between removing txs and runReorg loop. Run this with the -race flag to
 // ensure that there is no race condition between the two functions.
@@ -2902,7 +3002,7 @@ func TestPromoteExecutablesRecheckTx(t *testing.T) {
 	pool, rechecker, key := setupPool()
 	defer pool.Close()
 
-	initialDropped := queuedRecheckDropMeter.Snapshot().Count()
+	initialDropped := readCounterTotal(t, "txpool.queued.recheckdrop")
 
 	// Create transactions with sequential nonces
 	tx0 := transaction(0, 100000, key)
@@ -2964,7 +3064,7 @@ func TestPromoteExecutablesRecheckTx(t *testing.T) {
 	if pool.all.Get(tx2.Hash()) == nil {
 		t.Errorf("tx2 should still be in the all lookup")
 	}
-	dropped := queuedRecheckDropMeter.Snapshot().Count() - initialDropped
+	dropped := readCounterTotal(t, "txpool.queued.recheckdrop") - initialDropped
 	if dropped != 1 {
 		t.Error("1 queued recheck drops should have been recorded by meter delta, got", dropped)
 	}
@@ -2978,8 +3078,8 @@ func TestDemoteUnexecutablesRecheckTx(t *testing.T) {
 	pool, rechecker, _ := setupPool()
 	defer pool.Close()
 
-	initialDropped := pendingRecheckDropMeter.Snapshot().Count()
-	initialInvalidated := pendingDemotedRecheck.Snapshot().Count()
+	initialDropped := readCounterTotal(t, "txpool.pending.recheckdrop")
+	initialInvalidated := readCounterTotal(t, "txpool.pending.demoted.recheck")
 
 	// Create transactions with sequential nonces
 	key1, _ := crypto.GenerateKey()
@@ -3059,7 +3159,7 @@ func TestDemoteUnexecutablesRecheckTx(t *testing.T) {
 	}
 
 	// tx10 and tx22 got dropped
-	dropped := pendingRecheckDropMeter.Snapshot().Count() - initialDropped
+	dropped := readCounterTotal(t, "txpool.pending.recheckdrop") - initialDropped
 	if dropped != 2 {
 		t.Error("2 pending recheck drops should have been recorded by meter delta, got", dropped)
 	}
@@ -3067,7 +3167,7 @@ func TestDemoteUnexecutablesRecheckTx(t *testing.T) {
 	// tx11 and tx12 were invalidated since a tx from the same sender with a
 	// lower nonce was just dropped, they need to be validated again before
 	// being moved to pending, so they are back in queued
-	invaliated := pendingDemotedRecheck.Snapshot().Count() - initialInvalidated
+	invaliated := readCounterTotal(t, "txpool.pending.demoted.recheck") - initialInvalidated
 	if invaliated != 2 {
 		t.Error("2 pending recheck invalidate should have been recorded by meter delta, got", invaliated)
 	}
@@ -3165,6 +3265,184 @@ func TestRecheckedFutureHeight(t *testing.T) {
 	if result != nil {
 		t.Fatalf("expected nil from Pending when HeightSync times out, got %v", result)
 	}
+}
+
+func TestReplacementReapDeferral(t *testing.T) {
+	gasP := func(g int64) *int64 { return &g }
+
+	cases := []struct {
+		name                string
+		replacements        func(key *ecdsa.PrivateKey) []*types.Transaction
+		failRecheckGasPrice *int64
+		presentGasPrice     *int64
+	}{
+		{
+			name: "replacement tx that fails recheck is never reaped",
+			replacements: func(key *ecdsa.PrivateKey) []*types.Transaction {
+				return []*types.Transaction{
+					pricedTransaction(0, 100000, big.NewInt(2), key),
+				}
+			},
+			failRecheckGasPrice: gasP(2),
+		},
+		{
+			name: "replacement tx that passes recheck is reaped",
+			replacements: func(key *ecdsa.PrivateKey) []*types.Transaction {
+				return []*types.Transaction{
+					pricedTransaction(0, 100000, big.NewInt(2), key),
+				}
+			},
+			presentGasPrice: gasP(2),
+		},
+		{
+			// Chain of replacements within one block: each supersedes the
+			// previous in pending. Exactly one push happens at demote
+			// time, for the latest hash; earlier hashes are silently
+			// discarded when toReap is cleared.
+			name: "multi replacement txs only reaps latest",
+			replacements: func(key *ecdsa.PrivateKey) []*types.Transaction {
+				return []*types.Transaction{
+					pricedTransaction(0, 100000, big.NewInt(2), key),
+					pricedTransaction(0, 100000, big.NewInt(3), key),
+					pricedTransaction(0, 100000, big.NewInt(4), key),
+					pricedTransaction(0, 100000, big.NewInt(5), key),
+				}
+			},
+			presentGasPrice: gasP(5),
+		},
+	}
+
+	// findByGasPrice returns the tx in txs whose gas price matches.
+	// Replacements within a chain have unique gas prices, so this picks
+	// out exactly one tx.
+	findByGasPrice := func(txs []*types.Transaction, gasPrice int64) *types.Transaction {
+		target := big.NewInt(gasPrice)
+		for _, tx := range txs {
+			if tx.GasPrice().Cmp(target) == 0 {
+				return tx
+			}
+		}
+		return nil
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pool, rechecker, key := setupPool()
+			defer pool.Close()
+
+			addr := crypto.PubkeyToAddress(key.PublicKey)
+			testAddBalance(pool, addr, big.NewInt(100000000000000))
+
+			replacements := tc.replacements(key)
+
+			// base tx that replacements will be replacing
+			base := pricedTransaction(0, 100000, big.NewInt(1), key)
+			directPromoteToPending(t, pool, addr, base)
+			_ = reapAllHashes(pool) // drain initial promote push
+
+			if tc.failRecheckGasPrice != nil {
+				fail := big.NewInt(*tc.failRecheckGasPrice)
+				rechecker.SetRecheck(func(_ sdk.Context, tx *types.Transaction) (sdk.Context, error) {
+					if tx.GasPrice().Cmp(fail) == 0 {
+						return sdk.Context{}, errors.New("recheck fails for gas price")
+					}
+					return sdk.Context{}, nil
+				})
+			}
+
+			for _, r := range replacements {
+				replaced, err := pool.add(r)
+				require.NoError(t, err)
+				require.True(t, replaced)
+				require.Contains(t, pool.toReap, r.Hash())
+			}
+			require.Empty(t, reapAllHashes(pool), "replacements must be deferred until next demote")
+
+			pool.Reset(nil, nil)
+
+			reaped := reapAllHashes(pool)
+			require.Empty(t, pool.toReap)
+
+			if tc.presentGasPrice != nil {
+				want := findByGasPrice(replacements, *tc.presentGasPrice)
+				require.NotNil(t, pool.all.Get(want.Hash()), "tx at presentGasPrice should remain in pool.all")
+				require.Contains(t, reaped, want.Hash(), "tx at presentGasPrice should be on the reap list")
+			}
+
+			if tc.failRecheckGasPrice != nil {
+				want := findByGasPrice(replacements, *tc.failRecheckGasPrice)
+				require.Nil(t, pool.all.Get(want.Hash()), "tx at failRecheckGasPrice should be removed from pool.all")
+				require.NotContains(t, reaped, want.Hash(), "tx at failRecheckGasPrice should not be on the reap list")
+			}
+		})
+	}
+}
+
+func TestReplacementDemotedToQueueReapsViaPromote(t *testing.T) {
+	pool, rechecker, key := setupPool()
+	defer pool.Close()
+
+	addr := crypto.PubkeyToAddress(key.PublicKey)
+	testAddBalance(pool, addr, big.NewInt(100000000000000))
+
+	tx0 := pricedTransaction(0, 100000, big.NewInt(1), key)
+	tx1 := pricedTransaction(1, 100000, big.NewInt(1), key)
+	directPromoteToPending(t, pool, addr, tx0)
+	directPromoteToPending(t, pool, addr, tx1)
+	_ = reapAllHashes(pool)
+
+	replacement := pricedTransaction(1, 100000, big.NewInt(2), key)
+	replaced, err := pool.add(replacement)
+	require.NoError(t, err)
+	require.True(t, replaced)
+	require.Contains(t, pool.toReap, replacement.Hash())
+	require.Empty(t, reapAllHashes(pool))
+
+	rechecker.SetRecheck(func(_ sdk.Context, tx *types.Transaction) (sdk.Context, error) {
+		if tx.Hash() == tx0.Hash() {
+			return sdk.Context{}, errors.New("tx0 fails")
+		}
+		return sdk.Context{}, nil
+	})
+	pool.Reset(nil, nil)
+
+	require.Nil(t, pool.all.Get(tx0.Hash()))
+	require.NotNil(t, pool.all.Get(replacement.Hash()))
+	require.Nil(t, pool.pending[addr])
+	require.NotNil(t, pool.queue[addr])
+	require.Equal(t, 1, pool.queue[addr].Len())
+	require.Empty(t, pool.toReap)
+	require.Empty(t, reapAllHashes(pool), "replacement must not be reaped after demotion")
+
+	// advance state nonce so the replacement is ready on the next reset.
+	testSetNonce(pool, addr, 1)
+	rechecker.SetRecheck(nil)
+	pool.Reset(nil, nil)
+
+	// ensure we now reap the valid promoted tx
+	require.Equal(t, []common.Hash{replacement.Hash()}, reapAllHashes(pool))
+	require.Empty(t, pool.toReap)
+}
+
+func reapAllHashes(pool *LegacyPool) []common.Hash {
+	raw := pool.reapList.Reap(0, 0)
+	out := make([]common.Hash, 0, len(raw))
+	for _, b := range raw {
+		out = append(out, common.BytesToHash(b))
+	}
+	return out
+}
+
+func directPromoteToPending(t *testing.T, pool *LegacyPool, addr common.Address, tx *types.Transaction) {
+	t.Helper()
+	if _, hasPending := pool.pending[addr]; !hasPending {
+		if _, hasQueue := pool.queue[addr]; !hasQueue {
+			require.NoError(t, pool.reserver.Hold(addr))
+		}
+	}
+	pool.all.Add(tx)
+	pool.priced.Put(tx)
+	pool.promoteTx(addr, tx.Hash(), tx)
 }
 
 // Benchmarks the speed of validating the contents of the pending queue of the

@@ -12,6 +12,7 @@ import (
 	ethtypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/holiman/uint256"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
 
 	cmttypes "github.com/cometbft/cometbft/types"
 
@@ -30,7 +31,6 @@ import (
 	"cosmossdk.io/math"
 
 	"github.com/cosmos/cosmos-sdk/client"
-	"github.com/cosmos/cosmos-sdk/telemetry"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	sdkerrors "github.com/cosmos/cosmos-sdk/types/errors"
 	sdkmempool "github.com/cosmos/cosmos-sdk/types/mempool"
@@ -41,6 +41,10 @@ const (
 	SubscriberName = "evm"
 	// fallbackBlockGasLimit is the default block gas limit is 0 or missing in genesis file
 	fallbackBlockGasLimit = 100_000_000
+
+	// cosmosReserverHandlerID is the id of the reserver handler for the cosmos pool
+	// 0+ are reserved for evm sub-pools
+	cosmosReserverHandlerID = -1
 )
 
 // AllowUnsafeSyncInsert indicates whether to perform synchronous inserts into the mempool
@@ -49,6 +53,32 @@ const (
 var AllowUnsafeSyncInsert = false
 
 var meter = otel.Meter("github.com/cosmos/evm/mempool")
+
+var (
+	selectByDuration      metric.Float64Histogram
+	buildIteratorDuration metric.Float64Histogram
+)
+
+func init() {
+	var err error
+	selectByDuration, err = meter.Float64Histogram(
+		"mempool.selectby_duration",
+		metric.WithDescription("Time spent in SelectBy iterating over txs"),
+		metric.WithUnit("ms"),
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	buildIteratorDuration, err = meter.Float64Histogram(
+		"mempool.builditerator_duration",
+		metric.WithDescription("Time spent building the unified mempool iterator"),
+		metric.WithUnit("ms"),
+	)
+	if err != nil {
+		panic(err)
+	}
+}
 
 var _ sdkmempool.ExtMempool = (*Mempool)(nil)
 
@@ -70,6 +100,9 @@ type Config struct {
 	// pending insertion into the mempool. Note the insert queue is only used
 	// for EVM txs.
 	InsertQueueSize int
+	// EnableTxTracker controls whether the mempool records per-tx lifecycle
+	// telemetry (queued/pending/included latencies). Defaults to false.
+	EnableTxTracker bool
 }
 
 // Mempool is an application side mempool implementation that operates
@@ -100,11 +133,14 @@ type Mempool struct {
 	reapList *reaplist.ReapList
 
 	/** Transaction Tracking **/
-	txTracker *txtracker.TxTracker
+	txTracker txtracker.Tracker
 
 	/** Transaction Inserting **/
 	cosmosInsertQueue *queue.Queue[sdk.Tx]
 	evmInsertQueue    *queue.Queue[ethtypes.Transaction]
+
+	/** Signer extraction **/
+	signerExtractor sdkmempool.SignerExtractionAdapter
 }
 
 func NewMempool(
@@ -138,7 +174,10 @@ func NewMempool(
 	}
 
 	reapList := reaplist.New(NewTxEncoder(txConfig))
-	txTracker := txtracker.New()
+	txTracker := txtracker.NewNoop()
+	if config.EnableTxTracker {
+		txTracker = txtracker.New()
+	}
 	legacyPool := legacypool.New(
 		legacyConfig,
 		logger,
@@ -160,15 +199,23 @@ func NewMempool(
 		panic("tx pool should contain only legacypool")
 	}
 
+	heightSync := heightsync.New(
+		blockchain.CurrentBlock().Number,
+		NewCosmosTxStore,
+		logger.With("pool", "cosmos_recheck_mempool"),
+	)
+
+	reservationHandle := reservationTracker.NewHandle(cosmosReserverHandlerID, reserver.WithRefCounter())
+
 	recheckPool := NewRecheckMempool(
-		logger,
 		config.CosmosPoolConfig,
 		cosmosPoolMaxTx,
-		reservationTracker.NewHandle(-1),
+		reservationHandle,
 		cosmosRechecker,
-		heightsync.New(blockchain.CurrentBlock().Number, NewCosmosTxStore, logger.With("pool", "cosmos_recheck_mempool")),
+		heightSync,
 		reapList,
 		blockchain,
+		logger,
 	)
 
 	mempool := &Mempool{
@@ -184,10 +231,12 @@ func NewMempool(
 		pendingTxProposalTimeout: config.PendingTxProposalTimeout,
 		reapList:                 reapList,
 		txTracker:                txTracker,
+		signerExtractor:          NewEthSignerExtractionAdapter(sdkmempool.NewDefaultSignerExtractionAdapter()),
 	}
 
 	// Setup queues
 	mempool.evmInsertQueue = queue.New(
+		"evm",
 		func(txs []*ethtypes.Transaction) []error {
 			return txPool.Add(txs, AllowUnsafeSyncInsert)
 		},
@@ -195,6 +244,7 @@ func NewMempool(
 	)
 
 	mempool.cosmosInsertQueue = queue.New(
+		"cosmos",
 		func(txs []*sdk.Tx) []error {
 			errs := make([]error, len(txs))
 			for i, tx := range txs {
@@ -207,8 +257,6 @@ func NewMempool(
 		},
 		config.InsertQueueSize,
 	)
-
-	vmKeeper.SetEvmMempool(mempool)
 
 	// Start the cosmos pool recheck loop
 	mempool.recheckCosmosPool.Start(blockchain.CurrentBlock())
@@ -325,7 +373,9 @@ func (m *Mempool) Select(goCtx context.Context, i [][]byte) sdkmempool.Iterator 
 // It uses the same unified iterator as Select but allows early termination based on
 // custom criteria defined by the filter function.
 func (m *Mempool) SelectBy(goCtx context.Context, txs [][]byte, filter func(sdk.Tx) bool) {
-	defer func(t0 time.Time) { telemetry.MeasureSince(t0, "expmempool_selectby_duration") }(time.Now()) //nolint:staticcheck
+	defer func(t0 time.Time) {
+		selectByDuration.Record(goCtx, float64(time.Since(t0).Milliseconds()))
+	}(time.Now())
 
 	iter := m.buildIterator(goCtx, txs)
 
@@ -337,7 +387,9 @@ func (m *Mempool) SelectBy(goCtx context.Context, txs [][]byte, filter func(sdk.
 // buildIterator ensures that EVM mempool has checked txs for reorgs up to COMMITTED
 // block height and then returns a combined iterator over EVM & Cosmos txs.
 func (m *Mempool) buildIterator(ctx context.Context, txs [][]byte) sdkmempool.Iterator {
-	defer func(t0 time.Time) { telemetry.MeasureSince(t0, "expmempool_builditerator_duration") }(time.Now()) //nolint:staticcheck
+	defer func(t0 time.Time) {
+		buildIteratorDuration.Record(ctx, float64(time.Since(t0).Milliseconds()))
+	}(time.Now())
 
 	evmIterator, cosmosIterator := m.getIterators(ctx, txs)
 
@@ -366,56 +418,76 @@ func (m *Mempool) Remove(tx sdk.Tx) error {
 }
 
 // RemoveWithReason removes a transaction from the appropriate sdkmempool.
-// For EVM transactions, removal is typically handled automatically by the pool
-// based on nonce progression. Cosmos transactions are removed from the Cosmos pool.
-func (m *Mempool) RemoveWithReason(ctx context.Context, tx sdk.Tx, reason sdkmempool.RemoveReason) error {
-	chainCtx, err := m.blockchain.GetLatestContext()
-	if err != nil || chainCtx.BlockHeight() == 0 {
-		m.logger.Warn("Failed to get latest context, skipping removal")
-		return nil
-	}
-
+//
+// NOTE #1: even if removal fails, side effects may have occurred like recording
+// nonce increments.
+//
+// NOTE #2: This method might be called multiple times for the same tx:
+//   - during tx re-execution by BlockSTM
+//   - during tx execution by OptimisticExecution that fails
+//     and then inside another finalizeBlock() (e.g. consensus round increment)
+func (m *Mempool) RemoveWithReason(_ context.Context, tx sdk.Tx, reason sdkmempool.RemoveReason) error {
 	msgEthereumTx, err := evmTxFromCosmosTx(tx)
 	switch {
 	case errors.Is(err, ErrNoMessages):
 		return err
 	case err != nil:
 		// unable to parse evm tx -> process as cosmos tx
-		return m.removeCosmosTx(ctx, tx, reason)
+		return m.removeCosmosTx(tx, reason)
+	default:
+		return m.removeEVMTx(tx, msgEthereumTx, reason)
+	}
+}
+
+// removeCosmosTx removes a cosmos tx from the mempool.
+// The RecheckMempool handles locking internally.
+func (m *Mempool) removeCosmosTx(tx sdk.Tx, reason sdkmempool.RemoveReason) error {
+	m.logger.Debug("Removing Cosmos transaction")
+
+	if reason.Caller == sdkmempool.CallerRunTxFinalize {
+		m.recordNonceAdvances(tx)
 	}
 
+	if err := m.recheckCosmosPool.Remove(tx); err != nil {
+		return fmt.Errorf("recheckCosmosPool.Remove: %w", err)
+	}
+
+	m.logger.Debug("Cosmos transaction removed successfully")
+
+	return nil
+}
+
+// removeEVMTx removes a evm tx from the mempool.
+func (m *Mempool) removeEVMTx(tx sdk.Tx, msgEthereumTx *evmtypes.MsgEthereumTx, reason sdkmempool.RemoveReason) error {
+	m.logger.Debug("Removing EVM transaction")
+
 	hash := msgEthereumTx.Hash()
+	if reason.Caller == sdkmempool.CallerRunTxFinalize {
+		_ = m.txTracker.IncludedInBlock(hash)
+		m.recordNonceAdvances(tx)
+	}
 
 	if m.shouldRemoveFromEVMPool(hash, reason) {
 		m.logger.Debug("Manually removing EVM transaction", "tx_hash", hash)
 		m.legacyTxPool.RemoveTx(hash, false, true, convertRemovalReason(reason.Caller))
 	}
 
-	if reason.Caller == sdkmempool.CallerRunTxFinalize {
-		_ = m.txTracker.IncludedInBlock(hash)
-		if err := m.legacyTxPool.ScheduleForRemoval(msgEthereumTx.AsTransaction()); err != nil {
-			m.logger.Error("error scheduling tx for removal from legacypool", "err", err)
-		}
-	}
+	m.logger.Debug("EVM transaction removed successfully")
 
 	return nil
 }
 
-// removeCosmosTx removes a cosmos tx from the mempool.
-// The RecheckMempool handles locking internally.
-func (m *Mempool) removeCosmosTx(ctx context.Context, tx sdk.Tx, reason sdkmempool.RemoveReason) error {
-	m.logger.Debug("Removing Cosmos transaction")
-
-	// Remove from cosmos pool (handles address reservation release  and reap
-	// list drop internally)
-	err := sdkmempool.RemoveWithReason(ctx, m.recheckCosmosPool, tx, reason)
+// recordNonceAdvances records the on chain nonce advance for every signer of
+// tx in the legacypool.
+func (m *Mempool) recordNonceAdvances(tx sdk.Tx) {
+	signers, err := m.signerExtractor.GetSigners(tx)
 	if err != nil {
-		m.logger.Error("Failed to remove Cosmos transaction", "error", err)
-		return err
+		m.logger.Warn("could not extract signers for nonce tracking", "err", err)
+		return
 	}
-	m.logger.Debug("Cosmos transaction removed successfully")
-
-	return nil
+	for _, s := range signers {
+		m.legacyTxPool.SetLatestNonce(common.BytesToAddress(s.Signer), s.Sequence)
+	}
 }
 
 // shouldRemoveFromEVMPool determines whether an EVM transaction should be manually removed.
@@ -451,13 +523,17 @@ func (m *Mempool) SetEventBus(eventBus *cmttypes.EventBus) {
 		panic(err)
 	}
 	go func() {
-		bc := m.GetBlockchain()
 		for range sub.Out() {
-			bc.NotifyNewBlock()
-			// Trigger cosmos pool recheck on new block (non-blocking)
-			m.recheckCosmosPool.TriggerRecheck(bc.CurrentBlock())
+			m.NotifyNewBlock()
 		}
 	}()
+}
+
+// NotifyNewBlock manually notifies that there has been a new block produced
+// and it should update its internal data structures.
+func (m *Mempool) NotifyNewBlock() {
+	m.blockchain.NotifyNewBlock()
+	m.recheckCosmosPool.TriggerRecheck(m.blockchain.CurrentBlock())
 }
 
 // HasEventBus returns true if the blockchain is configured to use an event bus for block notifications.

@@ -115,25 +115,6 @@ func (suite *StateDBTestSuite) TestAccount() {
 	}
 }
 
-func (suite *StateDBTestSuite) TestAccountOverride() {
-	keeper := mocks.NewEVMKeeper()
-	db := statedb.New(sdk.Context{}.WithEventManager(sdk.NewEventManager()), keeper, emptyTxConfig)
-	// test balance carry over when overwritten
-	amount := uint256.NewInt(1)
-
-	// init an EOA account, account overridden only happens on EOA account.
-	db.AddBalance(address, amount, tracing.BalanceChangeUnspecified)
-	db.SetNonce(address, 1, tracing.NonceChangeUnspecified)
-
-	// override
-	db.CreateAccount(address)
-
-	// check balance is not lost
-	suite.Require().Equal(amount, db.GetBalance(address))
-	// but nonce is reset
-	suite.Require().Equal(uint64(0), db.GetNonce(address))
-}
-
 func (suite *StateDBTestSuite) TestDBError() {
 	testCases := []struct {
 		name     string
@@ -158,7 +139,6 @@ func (suite *StateDBTestSuite) TestDBError() {
 }
 
 func (suite *StateDBTestSuite) TestBalance() {
-	// NOTE: no need to test overflow/underflow, that is guaranteed by evm implementation.
 	testCases := []struct {
 		name       string
 		malleate   func(*statedb.StateDB)
@@ -195,6 +175,16 @@ func (suite *StateDBTestSuite) TestBalance() {
 			suite.Require().Equal(tc.expBalance, keeper.GetAccount(ctx, address).Balance)
 		})
 	}
+}
+
+func (suite *StateDBTestSuite) TestSubBalanceUnderflowPanics() {
+	db := statedb.New(sdk.Context{}.WithEventManager(sdk.NewEventManager()), mocks.NewEVMKeeper(), emptyTxConfig)
+	db.AddBalance(address, uint256.NewInt(1), tracing.BalanceChangeUnspecified)
+
+	expectedPanic := fmt.Sprintf("state balance underflow for %s: have=%s sub=%s", address.Hex(), "1", "2")
+	suite.Require().PanicsWithValue(expectedPanic, func() {
+		db.SubBalance(address, uint256.NewInt(2), tracing.BalanceChangeUnspecified)
+	})
 }
 
 func (suite *StateDBTestSuite) TestState() {

@@ -128,6 +128,11 @@ which accepts a path for the resulting pprof file.
 				return err
 			}
 
+			otelFile := filepath.Join(clientCtx.HomeDir, "config", telemetry.OtelFileName)
+			if err := telemetry.InitializeOpenTelemetry(otelFile); err != nil {
+				return fmt.Errorf("failed to initialize OpenTelemetry: %w", err)
+			}
+
 			withbft, _ := cmd.Flags().GetBool(srvflags.WithCometBFT)
 			if !withbft {
 				serverCtx.Logger.Info("starting ABCI without CometBFT")
@@ -203,7 +208,6 @@ which accepts a path for the resulting pprof file.
 	cmd.Flags().Uint64(srvflags.JSONRPCGasCap, cosmosevmserverconfig.DefaultGasCap, "Sets a cap on gas that can be used in eth_call/estimateGas unit is aatom (0=infinite)")                         //nolint:lll
 	cmd.Flags().Bool(srvflags.JSONRPCAllowInsecureUnlock, cosmosevmserverconfig.DefaultJSONRPCAllowInsecureUnlock, "Allow insecure account unlocking when account-related RPCs are exposed by http") //nolint:lll
 	cmd.Flags().Float64(srvflags.JSONRPCTxFeeCap, cosmosevmserverconfig.DefaultTxFeeCap, "Sets a cap on transaction fee that can be sent via the RPC APIs (1 = default 1 evmos)")                    //nolint:lll
-	cmd.Flags().Int32(srvflags.JSONRPCFilterCap, cosmosevmserverconfig.DefaultFilterCap, "Sets the global cap for total number of filters that can be created")
 	cmd.Flags().Duration(srvflags.JSONRPCEVMTimeout, cosmosevmserverconfig.DefaultEVMTimeout, "Sets a timeout used for eth_call (0=infinite)")
 	cmd.Flags().Duration(srvflags.JSONRPCHTTPTimeout, cosmosevmserverconfig.DefaultHTTPTimeout, "Sets a read/write timeout for json-rpc http server (0=infinite)")
 	cmd.Flags().Duration(srvflags.JSONRPCHTTPIdleTimeout, cosmosevmserverconfig.DefaultHTTPIdleTimeout, "Sets a idle timeout for json-rpc http server (0=infinite)")
@@ -238,6 +242,7 @@ which accepts a path for the resulting pprof file.
 	cmd.Flags().Duration(srvflags.EVMMempoolPendingTxProposalTimeout, mpDefaults.PendingTxProposalTimeout, "the maximum amount of time to spend waiting for rechecking of the mempool to complete when creating a proposal")
 	cmd.Flags().Duration(srvflags.EVMMempoolCheckTxTimeout, mpDefaults.CheckTxTimeout, "timeout for async CheckTx handler")
 	cmd.Flags().Int(srvflags.EVMMempoolInsertQueueSize, mpDefaults.InsertQueueSize, "the maximum number of transactions that can be in the insert queue at once")
+	cmd.Flags().Bool(srvflags.EVMMempoolEnableTxTracker, mpDefaults.EnableTxTracker, "enable per-tx lifecycle telemetry from the mempool (queued/pending/included latencies)")
 
 	cmd.Flags().String(srvflags.TLSCertPath, "", "the cert.pem file path for the server TLS configuration")
 	cmd.Flags().String(srvflags.TLSKeyPath, "", "the key.pem file path for the server TLS configuration")

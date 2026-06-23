@@ -77,8 +77,11 @@ const (
 	// DefaultJSONRPCAllowInsecureUnlock is true
 	DefaultJSONRPCAllowInsecureUnlock bool = true
 
-	// DefaultFilterCap is the default cap for total number of filters that can be created
-	DefaultFilterCap int32 = 200
+	// DefaultFilterTimeout defines when an idle filter expires.
+	DefaultFilterTimeout = 5 * time.Minute
+
+	// DefaultFilterCleanupInterval defines how often expired filters are cleaned up.
+	DefaultFilterCleanupInterval = 30 * time.Second
 
 	// DefaultFeeHistoryCap is the default cap for total number of blocks that can be fetched
 	DefaultFeeHistoryCap int32 = 100
@@ -186,6 +189,9 @@ type MempoolConfig struct {
 	// InsertQueueSize is the maximum number of transactions that can be in the
 	// insert queue at once (0 means unbounded)
 	InsertQueueSize int `mapstructure:"insert-queue-size"`
+	// EnableTxTracker enables per-tx lifecycle telemetry from the mempool
+	// (queued/pending/included latencies). Disabled by default.
+	EnableTxTracker bool `mapstructure:"enable-tx-tracker"`
 }
 
 // DefaultMempoolConfig returns the default mempool configuration
@@ -202,6 +208,7 @@ func DefaultMempoolConfig() MempoolConfig {
 		PendingTxProposalTimeout: 250 * time.Millisecond, // 250 milliseconds to wait for rechecks
 		CheckTxTimeout:           5 * time.Second,        // 5 seconds timeout for CheckTx handler.
 		InsertQueueSize:          5_000,                  // 5000 txs maximum in the insert queue
+		EnableTxTracker:          false,                  // tx lifecycle telemetry off by default
 	}
 }
 
@@ -256,8 +263,10 @@ type JSONRPCConfig struct {
 	EVMTimeout time.Duration `mapstructure:"evm-timeout"`
 	// TxFeeCap is the global tx-fee cap for send transaction
 	TxFeeCap float64 `mapstructure:"txfee-cap"`
-	// FilterCap is the global cap for total number of filters that can be created.
-	FilterCap int32 `mapstructure:"filter-cap"`
+	// FilterTimeout defines when an idle filter expires.
+	FilterTimeout time.Duration `mapstructure:"filter-timeout"`
+	// FilterCleanupInterval defines how often expired filters are cleaned up.
+	FilterCleanupInterval time.Duration `mapstructure:"filter-cleanup-interval"`
 	// FeeHistoryCap is the global cap for total number of blocks that can be fetched
 	FeeHistoryCap int32 `mapstructure:"feehistory-cap"`
 	// Enable defines if the EVM RPC server should be enabled.
@@ -348,29 +357,30 @@ func GetDefaultWSOrigins() []string {
 // DefaultJSONRPCConfig returns an EVM config with the JSON-RPC API enabled by default
 func DefaultJSONRPCConfig() *JSONRPCConfig {
 	return &JSONRPCConfig{
-		Enable:               false,
-		API:                  GetDefaultAPINamespaces(),
-		Address:              DefaultJSONRPCAddress,
-		WsAddress:            DefaultJSONRPCWsAddress,
-		GasCap:               DefaultGasCap,
-		AllowInsecureUnlock:  DefaultJSONRPCAllowInsecureUnlock,
-		EVMTimeout:           DefaultEVMTimeout,
-		TxFeeCap:             DefaultTxFeeCap,
-		FilterCap:            DefaultFilterCap,
-		FeeHistoryCap:        DefaultFeeHistoryCap,
-		BlockRangeCap:        DefaultBlockRangeCap,
-		LogsCap:              DefaultLogsCap,
-		HTTPTimeout:          DefaultHTTPTimeout,
-		HTTPIdleTimeout:      DefaultHTTPIdleTimeout,
-		HTTPBodyLimit:        DefaultHTTPBodyLimit,
-		AllowUnprotectedTxs:  DefaultAllowUnprotectedTxs,
-		BatchRequestLimit:    DefaultBatchRequestLimit,
-		BatchResponseMaxSize: DefaultBatchResponseMaxSize,
-		MaxOpenConnections:   DefaultMaxOpenConnections,
-		EnableIndexer:        false,
-		MetricsAddress:       DefaultJSONRPCMetricsAddress,
-		WSOrigins:            GetDefaultWSOrigins(),
-		EnableProfiling:      DefaultEnableProfiling,
+		Enable:                false,
+		API:                   GetDefaultAPINamespaces(),
+		Address:               DefaultJSONRPCAddress,
+		WsAddress:             DefaultJSONRPCWsAddress,
+		GasCap:                DefaultGasCap,
+		AllowInsecureUnlock:   DefaultJSONRPCAllowInsecureUnlock,
+		EVMTimeout:            DefaultEVMTimeout,
+		TxFeeCap:              DefaultTxFeeCap,
+		FilterTimeout:         DefaultFilterTimeout,
+		FilterCleanupInterval: DefaultFilterCleanupInterval,
+		FeeHistoryCap:         DefaultFeeHistoryCap,
+		BlockRangeCap:         DefaultBlockRangeCap,
+		LogsCap:               DefaultLogsCap,
+		HTTPTimeout:           DefaultHTTPTimeout,
+		HTTPIdleTimeout:       DefaultHTTPIdleTimeout,
+		HTTPBodyLimit:         DefaultHTTPBodyLimit,
+		AllowUnprotectedTxs:   DefaultAllowUnprotectedTxs,
+		BatchRequestLimit:     DefaultBatchRequestLimit,
+		BatchResponseMaxSize:  DefaultBatchResponseMaxSize,
+		MaxOpenConnections:    DefaultMaxOpenConnections,
+		EnableIndexer:         false,
+		MetricsAddress:        DefaultJSONRPCMetricsAddress,
+		WSOrigins:             GetDefaultWSOrigins(),
+		EnableProfiling:       DefaultEnableProfiling,
 	}
 }
 
@@ -380,8 +390,12 @@ func (c JSONRPCConfig) Validate() error {
 		return errors.New("cannot enable JSON-RPC without defining any API namespace")
 	}
 
-	if c.FilterCap < 0 {
-		return errors.New("JSON-RPC filter-cap cannot be negative")
+	if c.FilterTimeout < 0 {
+		return errors.New("JSON-RPC filter-timeout cannot be negative")
+	}
+
+	if c.FilterCleanupInterval < 0 {
+		return errors.New("JSON-RPC filter-cleanup-interval cannot be negative")
 	}
 
 	if c.FeeHistoryCap <= 0 {

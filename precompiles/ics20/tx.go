@@ -11,6 +11,7 @@ import (
 
 	cmn "github.com/cosmos/evm/precompiles/common"
 	erc20types "github.com/cosmos/evm/x/erc20/types"
+	callbackstypes "github.com/cosmos/evm/x/ibc/callbacks/types"
 	"github.com/cosmos/evm/x/vm/statedb"
 	transfertypes "github.com/cosmos/ibc-go/v11/modules/apps/transfer/types"
 	connectiontypes "github.com/cosmos/ibc-go/v11/modules/core/03-connection/types"
@@ -19,7 +20,6 @@ import (
 
 	errorsmod "cosmossdk.io/errors"
 
-	storetypes "github.com/cosmos/cosmos-sdk/store/v2/types"
 	"github.com/cosmos/cosmos-sdk/telemetry"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 )
@@ -98,21 +98,6 @@ func (p *Precompile) validateV1TransferChannel(ctx sdk.Context, msg *transfertyp
 // If user doesn't have enough balance of coin, it will attempt to convert
 // ERC20 tokens to the coin denomination, and continue with a regular transfer.
 func (p *Precompile) transferWithStateDB(ctx sdk.Context, stateDB *statedb.StateDB, msg *transfertypes.MsgTransfer) (*transfertypes.MsgTransferResponse, error) {
-	// Temporarily save the KV and transient KV gas config. To avoid extra costs for relayers
-	// these two gas config are replaced with empty one and should be restored before exiting this function.
-	kvGasCfg := ctx.KVGasConfig()
-	transientKVGasCfg := ctx.TransientKVGasConfig()
-	ctx = ctx.
-		WithKVGasConfig(storetypes.GasConfig{}).
-		WithTransientKVGasConfig(storetypes.GasConfig{})
-
-	defer func() {
-		// Return the KV gas config to initial values
-		ctx = ctx.
-			WithKVGasConfig(kvGasCfg).
-			WithTransientKVGasConfig(transientKVGasCfg)
-	}()
-
 	// use native denom or contract address
 	denom := strings.TrimPrefix(msg.Token.Denom, erc20types.Erc20NativeCoinDenomPrefix)
 
@@ -189,6 +174,11 @@ func (p *Precompile) Transfer(
 	method *abi.Method,
 	args []interface{},
 ) ([]byte, error) {
+	// Marker is set in the callbacks keeper and propagates here via cacheCtx.
+	if callbackstypes.IsSourceCallbackExecution(ctx) {
+		return nil, callbackstypes.ErrNestedSourceCallbackTransfer
+	}
+
 	msg, sender, err := NewMsgTransfer(method, args)
 	if err != nil {
 		return nil, err

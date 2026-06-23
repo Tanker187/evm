@@ -46,14 +46,17 @@ import (
 	"github.com/ethereum/go-ethereum/crypto/kzg4844"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/log"
-	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/holiman/uint256"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
 
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	"github.com/cosmos/evm/mempool/txpool"
 )
+
+var meter = otel.Meter("github.com/cosmos/evm/mempool/txpool/legacypool")
 
 const (
 	// txSlotSize is used to calculate how many data slots a single transaction
@@ -108,83 +111,191 @@ const (
 var (
 	// Specific removal metrics
 	// Queue pool
-	queuedRemovedLifetime          = metrics.NewRegisteredMeter("txpool/queued/removed/lifetime", nil)
-	queuedRemovedBelowTip          = metrics.NewRegisteredMeter("txpool/queued/removed/belowtip", nil)
-	queuedRemovedTruncatedOverflow = metrics.NewRegisteredMeter("txpool/queued/removed/truncated_overflow", nil)
-	queuedRemovedTruncatedLast     = metrics.NewRegisteredMeter("txpool/queued/removed/truncated_last", nil)
-	queuedRemovedUnderpricedFull   = metrics.NewRegisteredMeter("txpool/queued/removed/underpriced_full", nil)
-	queuedRemovedOld               = metrics.NewRegisteredMeter("txpool/queued/removed/old", nil)
-	queuedRemovedCapped            = metrics.NewRegisteredMeter("txpool/queued/removed/capped", nil)
-	queuedRemovedRunTxRecheck      = metrics.NewRegisteredMeter("txpool/queued/removed/runtx_recheck", nil)
-	queuedRemovedRunTxFinalize     = metrics.NewRegisteredMeter("txpool/queued/removed/runtx_finalize", nil)
-	queuedRemovedPrepareProposal   = metrics.NewRegisteredMeter("txpool/queued/removed/prepare_proposal_invalid", nil)
-	queuedRemovedUnknown           = metrics.NewRegisteredMeter("txpool/queued/removed/unknown", nil)
+	queuedRemovedLifetime          metric.Int64Counter
+	queuedRemovedBelowTip          metric.Int64Counter
+	queuedRemovedTruncatedOverflow metric.Int64Counter
+	queuedRemovedTruncatedLast     metric.Int64Counter
+	queuedRemovedUnderpricedFull   metric.Int64Counter
+	queuedRemovedOld               metric.Int64Counter
+	queuedRemovedCapped            metric.Int64Counter
+	queuedRemovedRunTxRecheck      metric.Int64Counter
+	queuedRemovedRunTxFinalize     metric.Int64Counter
+	queuedRemovedPrepareProposal   metric.Int64Counter
+	queuedRemovedUnknown           metric.Int64Counter
 	// Pending pool
-	pendingRemovedLifetime          = metrics.NewRegisteredMeter("txpool/pending/removed/lifetime", nil)
-	pendingRemovedBelowTip          = metrics.NewRegisteredMeter("txpool/pending/removed/belowtip", nil)
-	pendingRemovedTruncatedOverflow = metrics.NewRegisteredMeter("txpool/pending/removed/truncated_overflow", nil)
-	pendingRemovedTruncatedLast     = metrics.NewRegisteredMeter("txpool/pending/removed/truncated_last", nil)
-	pendingRemovedUnderpricedFull   = metrics.NewRegisteredMeter("txpool/pending/removed/underpriced_full", nil)
-	pendingRemovedOld               = metrics.NewRegisteredMeter("txpool/pending/removed/old", nil)
-	pendingRemovedCostly            = metrics.NewRegisteredMeter("txpool/pending/removed/costly", nil)
-	pendingRemovedCapped            = metrics.NewRegisteredMeter("txpool/pending/removed/capped", nil)
-	pendingRemovedRunTxRecheck      = metrics.NewRegisteredMeter("txpool/pending/removed/runtx_recheck", nil)
-	pendingRemovedRunTxFinalize     = metrics.NewRegisteredMeter("txpool/pending/removed/runtx_finalize", nil)
-	pendingRemovedPrepareProposal   = metrics.NewRegisteredMeter("txpool/pending/removed/prepare_proposal_invalid", nil)
-	pendingRemovedUnknown           = metrics.NewRegisteredMeter("txpool/pending/removed/unknown", nil)
+	pendingRemovedLifetime          metric.Int64Counter
+	pendingRemovedBelowTip          metric.Int64Counter
+	pendingRemovedTruncatedOverflow metric.Int64Counter
+	pendingRemovedTruncatedLast     metric.Int64Counter
+	pendingRemovedUnderpricedFull   metric.Int64Counter
+	pendingRemovedOld               metric.Int64Counter
+	pendingRemovedCostly            metric.Int64Counter
+	pendingRemovedCapped            metric.Int64Counter
+	pendingRemovedRunTxRecheck      metric.Int64Counter
+	pendingRemovedRunTxFinalize     metric.Int64Counter
+	pendingRemovedPrepareProposal   metric.Int64Counter
+	pendingRemovedUnknown           metric.Int64Counter
 
 	// Metrics for the pending pool
-	pendingDiscardMeter         = metrics.NewRegisteredMeter("txpool/pending/discard", nil)
-	pendingReplaceMeter         = metrics.NewRegisteredMeter("txpool/pending/replace", nil)
-	pendingRateLimitMeter       = metrics.NewRegisteredMeter("txpool/pending/ratelimit", nil)         // Dropped due to rate limiting
-	pendingRecheckDropMeter     = metrics.NewRegisteredMeter("txpool/pending/recheckdrop", nil)       // Dropped due to recheck failing
-	pendingRecheckDurationTimer = metrics.NewRegisteredTimer("txpool/pending/rechecktime", nil)       // How long rechecking txs in the pending pool takes (demoteUnexecutables)
-	pendingTruncateTimer        = metrics.NewRegisteredTimer("txpool/pending/truncate", nil)          // How long truncating the pending pool takes
-	pendingDemotedRecheck       = metrics.NewRegisteredMeter("txpool/pending/demoted/recheck", nil)   // Demoted due to parent tx failing recheck
-	pendingDemotedRemoved       = metrics.NewRegisteredMeter("txpool/pending/demoted/removed", nil)   // Demoted due to parent tx being explicitly removed
-	pendingDemotedCancelled     = metrics.NewRegisteredMeter("txpool/pending/demoted/cancelled", nil) // Demote loop cancelled due to a new block arriving
+	pendingDiscardMeter         metric.Int64Counter
+	pendingReplaceMeter         metric.Int64Counter
+	pendingRateLimitMeter       metric.Int64Counter     // Dropped due to rate limiting
+	pendingRecheckDropMeter     metric.Int64Counter     // Dropped due to recheck failing
+	pendingRecheckDurationTimer metric.Float64Histogram // How long rechecking txs in the pending pool takes (demoteUnexecutables)
+	pendingTruncateTimer        metric.Float64Histogram // How long truncating the pending pool takes
+	pendingDemotedRecheck       metric.Int64Counter     // Demoted due to parent tx failing recheck
+	pendingDemotedRemoved       metric.Int64Counter     // Demoted due to parent tx being explicitly removed
+	pendingDemotedCancelled     metric.Int64Counter     // Demote loop cancelled due to a new block arriving
 
 	// Metrics for queued promotions
-	queuedPromotedCancelled = metrics.NewRegisteredMeter("txpool/queued/promoted/cancelled", nil) // Promote loop cancelled due to a new block arriving
+	queuedPromotedCancelled metric.Int64Counter // Promote loop cancelled due to a new block arriving
 
 	// Metrics for the queued pool
-	queuedDiscardMeter         = metrics.NewRegisteredMeter("txpool/queued/discard", nil)
-	queuedReplaceMeter         = metrics.NewRegisteredMeter("txpool/queued/replace", nil)
-	queuedRateLimitMeter       = metrics.NewRegisteredMeter("txpool/queued/ratelimit", nil)   // Dropped due to rate limiting
-	queuedNofundsMeter         = metrics.NewRegisteredMeter("txpool/queued/nofunds", nil)     // Dropped due to out-of-funds
-	queuedEvictionMeter        = metrics.NewRegisteredMeter("txpool/queued/eviction", nil)    // Dropped due to lifetime
-	queuedRecheckDropMeter     = metrics.NewRegisteredMeter("txpool/queued/recheckdrop", nil) // Dropped due to antehandler failing
-	queuedRecheckDurationTimer = metrics.NewRegisteredTimer("txpool/queued/rechecktime", nil) // How long rechecking txs in the queued pool takes (promoteExecutables)
-	queuedNonReadies           = metrics.NewRegisteredMeter("txpool/queued/notready", nil)    // Number of txs that were not ready to be promoted due to a nonce gap during promote loop
+	queuedDiscardMeter         metric.Int64Counter
+	queuedReplaceMeter         metric.Int64Counter
+	queuedRateLimitMeter       metric.Int64Counter     // Dropped due to rate limiting
+	queuedNofundsMeter         metric.Int64Counter     // Dropped due to out-of-funds
+	queuedEvictionMeter        metric.Int64Counter     // Dropped due to lifetime
+	queuedRecheckDropMeter     metric.Int64Counter     // Dropped due to antehandler failing
+	queuedRecheckDurationTimer metric.Float64Histogram // How long rechecking txs in the queued pool takes (promoteExecutables)
+	queuedNonReadies           metric.Int64Counter     // Number of txs that were not ready to be promoted due to a nonce gap during promote loop
 
 	// General tx metrics
-	knownTxMeter       = metrics.NewRegisteredMeter("txpool/known", nil)
-	validTxMeter       = metrics.NewRegisteredMeter("txpool/valid", nil)
-	invalidTxMeter     = metrics.NewRegisteredMeter("txpool/invalid", nil)
-	underpricedTxMeter = metrics.NewRegisteredMeter("txpool/underpriced", nil)
-	overflowedTxMeter  = metrics.NewRegisteredMeter("txpool/overflowed", nil)
+	knownTxMeter       metric.Int64Counter
+	validTxMeter       metric.Int64Counter
+	invalidTxMeter     metric.Int64Counter
+	underpricedTxMeter metric.Int64Counter
+	overflowedTxMeter  metric.Int64Counter
 
 	// throttleTxMeter counts how many transactions are rejected due to too-many-changes between
 	// txpool reorgs.
-	throttleTxMeter = metrics.NewRegisteredMeter("txpool/throttle", nil)
+	throttleTxMeter metric.Int64Counter
 
 	// reorgDurationTimer measures how long time a txpool reorg takes.
-	reorgDurationTimer = metrics.NewRegisteredTimer("txpool/reorgtime", nil)
+	reorgDurationTimer metric.Float64Histogram
 	// reorgResetTimer measures how long a txpool reorg takes when it is resetting.
-	reorgResetTimer = metrics.NewRegisteredTimer("txpool/resettime", nil)
+	reorgResetTimer metric.Float64Histogram
 	// demoteTimer measures how long demoting transactions in the pending pool takes
-	demoteTimer = metrics.NewRegisteredTimer("txpool/demotetime", nil)
+	demoteTimer metric.Float64Histogram
 
 	// dropBetweenReorgHistogram counts how many drops we experience between two reorg runs. It is expected
 	// that this number is pretty low, since txpool reorgs happen very frequently.
-	dropBetweenReorgHistogram = metrics.NewRegisteredHistogram("txpool/dropbetweenreorg", nil, metrics.NewExpDecaySample(1028, 0.015))
+	dropBetweenReorgHistogram metric.Int64Histogram
 
-	pendingGauge = metrics.NewRegisteredGauge("txpool/pending", nil)
-	queuedGauge  = metrics.NewRegisteredGauge("txpool/queued", nil)
-	slotsGauge   = metrics.NewRegisteredGauge("txpool/slots", nil)
+	pendingGauge metric.Int64UpDownCounter
+	queuedGauge  metric.Int64UpDownCounter
+	slotsGauge   metric.Int64Gauge
 
-	reheapTimer = metrics.NewRegisteredTimer("txpool/reheap", nil)
+	reheapTimer metric.Float64Histogram
 )
+
+func init() {
+	counter := func(name, desc string) metric.Int64Counter {
+		m, err := meter.Int64Counter(name, metric.WithDescription(desc))
+		if err != nil {
+			panic(err)
+		}
+		return m
+	}
+	timer := func(name, desc string) metric.Float64Histogram {
+		m, err := meter.Float64Histogram(name, metric.WithDescription(desc), metric.WithUnit("ms"))
+		if err != nil {
+			panic(err)
+		}
+		return m
+	}
+
+	queuedRemovedLifetime = counter("txpool.queued.removed.lifetime", "Queued txs removed due to lifetime")
+	queuedRemovedBelowTip = counter("txpool.queued.removed.belowtip", "Queued txs removed due to min gas tip change")
+	queuedRemovedTruncatedOverflow = counter("txpool.queued.removed.truncated_overflow", "Queued txs removed due to truncation overflow")
+	queuedRemovedTruncatedLast = counter("txpool.queued.removed.truncated_last", "Queued txs removed as last-in during truncation")
+	queuedRemovedUnderpricedFull = counter("txpool.queued.removed.underpriced_full", "Queued txs removed to make room for better priced tx")
+	queuedRemovedOld = counter("txpool.queued.removed.old", "Queued txs removed due to nonce being too old")
+	queuedRemovedCapped = counter("txpool.queued.removed.capped", "Queued txs removed due to per-account cap")
+	queuedRemovedRunTxRecheck = counter("txpool.queued.removed.runtx_recheck", "Queued txs removed due to RunTx recheck failure")
+	queuedRemovedRunTxFinalize = counter("txpool.queued.removed.runtx_finalize", "Queued txs removed due to RunTx finalize")
+	queuedRemovedPrepareProposal = counter("txpool.queued.removed.prepare_proposal_invalid", "Queued txs removed as invalid during PrepareProposal")
+	queuedRemovedUnknown = counter("txpool.queued.removed.unknown", "Queued txs removed for an unknown reason")
+
+	pendingRemovedLifetime = counter("txpool.pending.removed.lifetime", "Pending txs removed due to lifetime")
+	pendingRemovedBelowTip = counter("txpool.pending.removed.belowtip", "Pending txs removed due to min gas tip change")
+	pendingRemovedTruncatedOverflow = counter("txpool.pending.removed.truncated_overflow", "Pending txs removed due to truncation overflow")
+	pendingRemovedTruncatedLast = counter("txpool.pending.removed.truncated_last", "Pending txs removed as last-in during truncation")
+	pendingRemovedUnderpricedFull = counter("txpool.pending.removed.underpriced_full", "Pending txs removed to make room for better priced tx")
+	pendingRemovedOld = counter("txpool.pending.removed.old", "Pending txs removed due to nonce being too old")
+	pendingRemovedCostly = counter("txpool.pending.removed.costly", "Pending txs removed as too costly")
+	pendingRemovedCapped = counter("txpool.pending.removed.capped", "Pending txs removed due to per-account cap")
+	pendingRemovedRunTxRecheck = counter("txpool.pending.removed.runtx_recheck", "Pending txs removed due to RunTx recheck failure")
+	pendingRemovedRunTxFinalize = counter("txpool.pending.removed.runtx_finalize", "Pending txs removed due to RunTx finalize")
+	pendingRemovedPrepareProposal = counter("txpool.pending.removed.prepare_proposal_invalid", "Pending txs removed as invalid during PrepareProposal")
+	pendingRemovedUnknown = counter("txpool.pending.removed.unknown", "Pending txs removed for an unknown reason")
+
+	pendingDiscardMeter = counter("txpool.pending.discard", "Pending txs discarded")
+	pendingReplaceMeter = counter("txpool.pending.replace", "Pending txs replaced")
+	pendingRateLimitMeter = counter("txpool.pending.ratelimit", "Pending txs dropped due to rate limiting")
+	pendingRecheckDropMeter = counter("txpool.pending.recheckdrop", "Pending txs dropped due to recheck failing")
+	pendingRecheckDurationTimer = timer("txpool.pending.rechecktime", "Time to recheck txs in the pending pool (demoteUnexecutables)")
+	pendingTruncateTimer = timer("txpool.pending.truncate", "Time to truncate the pending pool")
+	pendingDemotedRecheck = counter("txpool.pending.demoted.recheck", "Pending txs demoted due to parent tx failing recheck")
+	pendingDemotedRemoved = counter("txpool.pending.demoted.removed", "Pending txs demoted due to parent tx being explicitly removed")
+	pendingDemotedCancelled = counter("txpool.pending.demoted.cancelled", "Demote loop cancelled due to new block arrival")
+
+	queuedPromotedCancelled = counter("txpool.queued.promoted.cancelled", "Promote loop cancelled due to new block arrival")
+
+	queuedDiscardMeter = counter("txpool.queued.discard", "Queued txs discarded")
+	queuedReplaceMeter = counter("txpool.queued.replace", "Queued txs replaced")
+	queuedRateLimitMeter = counter("txpool.queued.ratelimit", "Queued txs dropped due to rate limiting")
+	queuedNofundsMeter = counter("txpool.queued.nofunds", "Queued txs dropped due to out-of-funds")
+	queuedEvictionMeter = counter("txpool.queued.eviction", "Queued txs dropped due to lifetime")
+	queuedRecheckDropMeter = counter("txpool.queued.recheckdrop", "Queued txs dropped due to antehandler failure")
+	queuedRecheckDurationTimer = timer("txpool.queued.rechecktime", "Time to recheck txs in the queued pool (promoteExecutables)")
+	queuedNonReadies = counter("txpool.queued.notready", "Queued txs not ready for promotion due to nonce gap")
+
+	knownTxMeter = counter("txpool.known", "Txs discarded as already known")
+	validTxMeter = counter("txpool.valid", "Txs deemed valid by the pool")
+	invalidTxMeter = counter("txpool.invalid", "Txs discarded as invalid")
+	underpricedTxMeter = counter("txpool.underpriced", "Txs discarded as underpriced")
+	overflowedTxMeter = counter("txpool.overflowed", "Txs discarded due to pool overflow")
+
+	throttleTxMeter = counter("txpool.throttle", "Txs rejected due to too-many-changes between reorgs")
+
+	reorgDurationTimer = timer("txpool.reorgtime", "Time taken to run a txpool reorg")
+	reorgResetTimer = timer("txpool.resettime", "Time taken to reset state during a txpool reorg")
+	demoteTimer = timer("txpool.demotetime", "Time taken to demote txs in the pending pool")
+
+	var err error
+	dropBetweenReorgHistogram, err = meter.Int64Histogram(
+		"txpool.dropbetweenreorg",
+		metric.WithDescription("Number of drops observed between two reorg runs"),
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	pendingGauge, err = meter.Int64UpDownCounter(
+		"txpool.pending",
+		metric.WithDescription("Current number of txs in the pending pool"),
+	)
+	if err != nil {
+		panic(err)
+	}
+	queuedGauge, err = meter.Int64UpDownCounter(
+		"txpool.queued",
+		metric.WithDescription("Current number of txs in the queued pool"),
+	)
+	if err != nil {
+		panic(err)
+	}
+	slotsGauge, err = meter.Int64Gauge(
+		"txpool.slots",
+		metric.WithDescription("Current number of slots in use by tracked txs"),
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	reheapTimer = timer("txpool.reheap", "Time taken to reheap the priced list")
+}
 
 type PoolType string
 
@@ -344,6 +455,7 @@ type LegacyPool struct {
 	rechecker           Rechecker                          // Checks a tx for validity against the current state
 
 	validPendingTxs *heightsync.HeightSync[TxStore] // Per height store of pending txs that have been validated
+	toReap          map[common.Hash]struct{}        // Transactions that should be reaped after their next recheck
 
 	pending map[common.Address]*list     // All currently processable transactions
 	queue   map[common.Address]*list     // Queued but non-processable transactions
@@ -362,8 +474,8 @@ type LegacyPool struct {
 
 	changesSinceReorg int // A counter for how many drops we've performed in-between reorg.
 
-	reapList *reaplist.ReapList   // Queue of txs to be reaped by comet and gossiped
-	tracker  *txtracker.TxTracker // Track tx lifecycle events for metrics
+	reapList *reaplist.ReapList // Queue of txs to be reaped by comet and gossiped
+	tracker  txtracker.Tracker  // Track tx lifecycle events for metrics
 }
 
 type txpoolResetRequest struct {
@@ -389,7 +501,7 @@ func New(
 	logger cosmoslog.Logger,
 	chain BlockChain,
 	reapList *reaplist.ReapList,
-	tracker *txtracker.TxTracker,
+	tracker txtracker.Tracker,
 	opts ...Option,
 ) *LegacyPool {
 	if reapList == nil {
@@ -418,6 +530,7 @@ func New(
 		reapList:            reapList,
 		tracker:             tracker,
 		validPendingTxs:     heightsync.New(chain.CurrentBlock().Number, NewTxStore, logger.With("pool", "legacypool")),
+		toReap:              make(map[common.Hash]struct{}),
 		reqResetCh:          make(chan *txpoolResetRequest),
 		reqPromoteCh:        make(chan *accountSet),
 		reqCancelResetCh:    make(chan struct{}),
@@ -436,19 +549,19 @@ func New(
 	return pool
 }
 
-// ScheduleForRemoval schedules a tx to be removed from the mempool the next
-// time it is reset. This is typically called when a tx is included on chain.
-func (pool *LegacyPool) ScheduleForRemoval(tx *types.Transaction) error {
-	sender, err := types.Sender(pool.signer, tx)
-	if err != nil {
-		return fmt.Errorf("getting tx signer: %w", err)
-	}
-
+// SetLatestNonce records the latest on chain nonce observed for an account.
+func (pool *LegacyPool) SetLatestNonce(sender common.Address, nonce uint64) {
 	existing, ok := pool.latestIncludedNonce.Get(sender)
-	if !ok || tx.Nonce() > existing {
-		pool.latestIncludedNonce.Add(sender, tx.Nonce())
+	if !ok || nonce > existing {
+		pool.latestIncludedNonce.Add(sender, nonce)
 	}
-	return nil
+}
+
+// LatestNonce returns the most recently recorded latest-included nonce for
+// addr and whether an entry exists in the cache. Primarily useful for tests
+// and debugging.
+func (pool *LegacyPool) LatestNonce(addr common.Address) (uint64, bool) {
+	return pool.latestIncludedNonce.Get(addr)
 }
 
 // removeOlds removes txs that have been scheduled for removals from
@@ -557,7 +670,7 @@ func (pool *LegacyPool) loop() {
 					for _, tx := range list {
 						pool.removeTx(tx.Hash(), true, true, RemovalReasonLifetime)
 					}
-					queuedEvictionMeter.Mark(int64(len(list)))
+					queuedEvictionMeter.Add(context.Background(), int64(len(list)))
 				}
 			}
 			pool.mu.Unlock()
@@ -704,7 +817,7 @@ func (pool *LegacyPool) Rechecked(ctx context.Context, height *big.Int, filter t
 	if txStore == nil {
 		return nil
 	}
-	return txStore.Txs(filter)
+	return txStore.Txs(ctx, filter)
 }
 
 // Pending retrieves all currently processable transactions, grouped by origin
@@ -878,14 +991,14 @@ func (pool *LegacyPool) add(tx *types.Transaction) (replaced bool, err error) {
 	hash := tx.Hash()
 	if pool.all.Get(hash) != nil {
 		log.Trace("Discarding already known transaction", "hash", hash)
-		knownTxMeter.Mark(1)
+		knownTxMeter.Add(context.Background(), 1)
 		return false, txpool.ErrAlreadyKnown
 	}
 
 	// If the transaction fails basic validation, discard it
 	if err := pool.validateTx(tx); err != nil {
 		log.Trace("Discarding invalid transaction", "hash", hash, "err", err)
-		invalidTxMeter.Mark(1)
+		invalidTxMeter.Add(context.Background(), 1)
 		return false, err
 	}
 	// already validated by this point
@@ -918,7 +1031,7 @@ func (pool *LegacyPool) add(tx *types.Transaction) (replaced bool, err error) {
 		// If the new transaction is underpriced, don't accept it
 		if pool.priced.Underpriced(tx) {
 			log.Trace("Discarding underpriced transaction", "hash", hash, "gasTipCap", tx.GasTipCap(), "gasFeeCap", tx.GasFeeCap())
-			underpricedTxMeter.Mark(1)
+			underpricedTxMeter.Add(context.Background(), 1)
 			return false, txpool.ErrUnderpriced
 		}
 
@@ -927,7 +1040,7 @@ func (pool *LegacyPool) add(tx *types.Transaction) (replaced bool, err error) {
 		// do too many replacements between reorg-runs, so we cap the number of
 		// replacements to 25% of the slots
 		if pool.changesSinceReorg > int(pool.config.GlobalSlots/4) {
-			throttleTxMeter.Mark(1)
+			throttleTxMeter.Add(context.Background(), 1)
 			return false, ErrTxPoolOverflow
 		}
 
@@ -938,7 +1051,7 @@ func (pool *LegacyPool) add(tx *types.Transaction) (replaced bool, err error) {
 		// Special case, we still can't make the room for the new remote one.
 		if !success {
 			log.Trace("Discarding overflown transaction", "hash", hash)
-			overflowedTxMeter.Mark(1)
+			overflowedTxMeter.Add(context.Background(), 1)
 			return false, ErrTxPoolOverflow
 		}
 
@@ -965,7 +1078,7 @@ func (pool *LegacyPool) add(tx *types.Transaction) (replaced bool, err error) {
 		// Kick out the underpriced remote transactions.
 		for _, tx := range drop {
 			log.Trace("Discarding freshly underpriced transaction", "hash", tx.Hash(), "gasTipCap", tx.GasTipCap(), "gasFeeCap", tx.GasFeeCap())
-			underpricedTxMeter.Mark(1)
+			underpricedTxMeter.Add(context.Background(), 1)
 
 			sender, _ := types.Sender(pool.signer, tx)
 			dropped := pool.removeTx(tx.Hash(), false, sender != from, RemovalReasonUnderpricedFull) // Don't unreserve the sender of the tx being added if last from the acc
@@ -979,7 +1092,7 @@ func (pool *LegacyPool) add(tx *types.Transaction) (replaced bool, err error) {
 		// Nonce already pending, check if required price bump is met
 		inserted, old := list.Add(tx, pool.config.PriceBump)
 		if !inserted {
-			pendingDiscardMeter.Mark(1)
+			pendingDiscardMeter.Add(context.Background(), 1)
 			return false, txpool.ErrReplaceUnderpriced
 		}
 		// New transaction is better, replace old one
@@ -987,7 +1100,7 @@ func (pool *LegacyPool) add(tx *types.Transaction) (replaced bool, err error) {
 			pool.all.Remove(old.Hash())
 			pool.priced.Removed(1)
 			pool.markTxRemoved(from, old, Pending)
-			pendingReplaceMeter.Mark(1)
+			pendingReplaceMeter.Add(context.Background(), 1)
 		}
 		pool.all.Add(tx)
 		pool.priced.Put(tx)
@@ -1048,18 +1161,18 @@ func (pool *LegacyPool) enqueueTx(hash common.Hash, tx *types.Transaction, addAl
 	inserted, old := pool.queue[from].Add(tx, pool.config.PriceBump)
 	if !inserted {
 		// An older transaction was better, discard this
-		queuedDiscardMeter.Mark(1)
+		queuedDiscardMeter.Add(context.Background(), 1)
 		return false, txpool.ErrReplaceUnderpriced
 	}
 	// Discard any previous transaction and mark this
 	if old != nil {
 		pool.all.Remove(old.Hash())
 		pool.priced.Removed(1)
-		queuedReplaceMeter.Mark(1)
+		queuedReplaceMeter.Add(context.Background(), 1)
 		pool.markTxRemoved(from, old, Queue)
 	} else {
 		// Nothing was replaced, bump the queued counter
-		queuedGauge.Inc(1)
+		queuedGauge.Add(context.Background(), 1)
 	}
 	// If the transaction isn't in lookup set but it's expected to be there,
 	// show the error log.
@@ -1095,7 +1208,7 @@ func (pool *LegacyPool) promoteTx(addr common.Address, hash common.Hash, tx *typ
 		pool.all.Remove(hash)
 		pool.priced.Removed(1)
 		pool.markTxRemoved(addr, tx, Queue)
-		pendingDiscardMeter.Mark(1)
+		pendingDiscardMeter.Add(context.Background(), 1)
 		return false
 	}
 	// Otherwise discard any previous transaction and mark this
@@ -1105,10 +1218,10 @@ func (pool *LegacyPool) promoteTx(addr common.Address, hash common.Hash, tx *typ
 		pool.all.Remove(old.Hash())
 		pool.priced.Removed(1)
 		pool.markTxRemoved(addr, old, Pending)
-		pendingReplaceMeter.Mark(1)
+		pendingReplaceMeter.Add(context.Background(), 1)
 	} else {
 		// Nothing was replaced, bump the pending counter
-		pendingGauge.Inc(1)
+		pendingGauge.Add(context.Background(), 1)
 	}
 	// Set the potentially new pending nonce and notify any subsystems of the new tx
 	pool.pendingNonces.set(addr, tx.Nonce()+1)
@@ -1158,7 +1271,7 @@ func (pool *LegacyPool) Add(txs []*types.Transaction, sync bool) []error {
 		// If the transaction is known, pre-set the error slot
 		if pool.all.Get(tx.Hash()) != nil {
 			errs[i] = txpool.ErrAlreadyKnown
-			knownTxMeter.Mark(1)
+			knownTxMeter.Add(context.Background(), 1)
 			continue
 		}
 		// Exclude transactions with basic errors, e.g invalid signatures and
@@ -1167,7 +1280,7 @@ func (pool *LegacyPool) Add(txs []*types.Transaction, sync bool) []error {
 		if err := pool.ValidateTxBasics(tx); err != nil {
 			errs[i] = err
 			log.Trace("Discarding invalid transaction", "hash", tx.Hash(), "err", err)
-			invalidTxMeter.Mark(1)
+			invalidTxMeter.Add(context.Background(), 1)
 			continue
 		}
 		// Accumulate all unknown transactions for deeper processing
@@ -1210,7 +1323,7 @@ func (pool *LegacyPool) addTxsLocked(txs []*types.Transaction) ([]error, *accoun
 			dirty.addTx(tx)
 		}
 	}
-	validTxMeter.Mark(int64(len(dirty.accounts)))
+	validTxMeter.Add(context.Background(), int64(len(dirty.accounts)))
 	return errs, dirty
 }
 
@@ -1344,7 +1457,7 @@ func (pool *LegacyPool) removeTx(hash common.Hash, outofbound bool, unreserve bo
 	if pending := pool.pending[addr]; pending != nil {
 		if removed, invalids := pending.Remove(tx); removed {
 			pool.markTxRemoved(addr, tx, Pending)
-			pendingRemovalMetric(reason).Mark(1)
+			pendingRemovalMetric(reason).Add(context.Background(), 1)
 
 			// If no more pending transactions are left, remove the list
 			if pending.Empty() {
@@ -1358,8 +1471,8 @@ func (pool *LegacyPool) removeTx(hash common.Hash, outofbound bool, unreserve bo
 			// Update the account nonce if needed
 			pool.pendingNonces.setIfLower(addr, tx.Nonce())
 			// Reduce the pending counter
-			pendingGauge.Dec(int64(1 + len(invalids)))
-			pendingDemotedRemoved.Mark(int64(len(invalids)))
+			pendingGauge.Add(context.Background(), -int64(1+len(invalids)))
+			pendingDemotedRemoved.Add(context.Background(), int64(len(invalids)))
 			return 1 + len(invalids)
 		}
 	}
@@ -1367,10 +1480,10 @@ func (pool *LegacyPool) removeTx(hash common.Hash, outofbound bool, unreserve bo
 	if future := pool.queue[addr]; future != nil {
 		if removed, _ := future.Remove(tx); removed {
 			pool.markTxRemoved(addr, tx, Queue)
-			queueRemovalMetric(reason).Mark(1)
+			queueRemovalMetric(reason).Add(context.Background(), 1)
 
 			// Reduce the queued counter
-			queuedGauge.Dec(1)
+			queuedGauge.Add(context.Background(), -1)
 		}
 		if future.Empty() {
 			delete(pool.queue, addr)
@@ -1510,12 +1623,56 @@ type reorgInput struct {
 	events        map[common.Address]*SortedMap
 }
 
+// computePendingTipNonces returns a mapping from account address to the next
+// expected nonce, taking the pending pool entries into account, but not the
+// queued pool entries.
+func (pool *LegacyPool) computePendingTipNonces() map[common.Address]uint64 {
+	tips := make(map[common.Address]uint64, len(pool.pending))
+	for addr, list := range pool.pending {
+		// get the next nonce that should be included on chain after last
+		// pending pool tx for this account lands
+		nextPendingNonce := list.LastElement().Nonce() + 1
+
+		// grab the latest nonce that we have observed on chain for this
+		// account if we have it cached
+		latestIncludedNonce, ok := pool.latestIncludedNonce.Get(addr)
+		if ok {
+			// if we have a cached on chain nonce for this account, it likely
+			// had a tx land in the latest block and its last pending pool
+			// element may be stale if we have not yet run demoteUnexecutables
+			// yet. thus, if the latestIncludedNonce + 1 is > nextPendingNonce,
+			// then that is actually what we should be using as the 'tip' of
+			// the pending pool for this account
+			//
+			// NOTE: latestIncludedNonce is a lru cache (lru to manage its
+			// growth). It is strongly recommended to the user to configure
+			// this cache size > the max number of unique accounts they expect
+			// to see in a block. If they do not do so, an issue could manifest
+			// here where a block has more accounts than entries in the
+			// latestIncludedNonce cache. If an entry gets evicted from
+			// latestIncludedNonce for an account that was included in H-1,
+			// then calling this function at H will use a stale
+			// nextPendingNonce value (when compared to statedb.GetNonce(addr))
+			// if this function is called before demoteUnexecutables, causing a
+			// queued contiguous nonce tx (with respect to pending txs) to not
+			// be promoted if there is a race on resetting + promoting the
+			// queued tx after insert. This is unlikely and would require a
+			// misconfiguration by the user, but this is a documented possible
+			// scenario.
+			nextPendingNonce = max(nextPendingNonce, latestIncludedNonce+1)
+		}
+		tips[addr] = nextPendingNonce
+	}
+	return tips
+}
+
 // runReorg runs reset and promoteExecutables on behalf of scheduleReorgLoop.
 func (pool *LegacyPool) runReorg(input reorgInput) {
 	defer func(t0 time.Time) {
-		reorgDurationTimer.UpdateSince(t0)
+		elapsedMS := float64(time.Since(t0).Milliseconds())
+		reorgDurationTimer.Record(context.Background(), elapsedMS)
 		if input.reset != nil {
-			reorgResetTimer.UpdateSince(t0)
+			reorgResetTimer.Record(context.Background(), elapsedMS)
 		}
 	}(time.Now())
 	defer close(input.done)
@@ -1566,12 +1723,7 @@ func (pool *LegacyPool) runReorg(input reorgInput) {
 			}
 		}
 		// Update all accounts to the latest known pending nonce
-		nonces := make(map[common.Address]uint64, len(pool.pending))
-		for addr, list := range pool.pending {
-			highestPending := list.LastElement()
-			nonces[addr] = highestPending.Nonce() + 1
-		}
-		pool.pendingNonces.setAll(nonces)
+		pool.pendingNonces.setAll(pool.computePendingTipNonces())
 		pool.validPendingTxs.EndCurrentHeight()
 	}
 
@@ -1585,7 +1737,7 @@ func (pool *LegacyPool) runReorg(input reorgInput) {
 	pool.truncatePending()
 	pool.truncateQueue()
 
-	dropBetweenReorgHistogram.Update(int64(pool.changesSinceReorg))
+	dropBetweenReorgHistogram.Record(context.Background(), int64(pool.changesSinceReorg))
 	pool.changesSinceReorg = 0 // Reset change counter
 	pool.mu.Unlock()
 
@@ -1629,6 +1781,26 @@ func (pool *LegacyPool) resetInternalState(newHead *types.Header, reinject types
 	pool.currentHead.Store(newHead)
 	pool.currentState = statedb
 	pool.pendingNonces = newNoncer(statedb)
+
+	// a brand new noncer only knows the statedb's committed nonce, which may
+	// be behind the tip of pool.pending nonce wise. we need to reconcile
+	// the noncer with the current pending tip so that any subsequent
+	// promoteExecutables can still promote queued txs whose nonces are
+	// contiguous with pending.
+	//
+	// without this the following scenario is possible:
+	// - pool.pending = [tx0, tx1], pool.queue = [tx2].
+	// - statedb nonce for this account is 0 (nothing included on chain).
+	// - reset runs **before** the async promotion gets scheduled, or they are batched together.
+	// - pendingNonces reset = newNoncer(statedb), noncer map empty so
+	//   get(addr) falls back to nonce 0 from statedb.
+	// - promoteExecutables calls list.Ready(0) on pool.queue = [tx2], sees
+	//   lowest nonce 2 > 0, returns a gap, promotes nothing.
+	// - tx2 stays stuck in queued even though it is contiguous with pending.
+	// - tx2 must wait for another insert from this account in order to be
+	//   promoted, or the existing pending txs are included on chain.
+	pool.pendingNonces.setAll(pool.computePendingTipNonces())
+
 	ctx, err := pool.chain.GetLatestContext()
 	if err != nil {
 		panic(fmt.Errorf("failed to get latest context for rechecker: %w", err))
@@ -1663,13 +1835,10 @@ func (pool *LegacyPool) promoteExecutables(accounts []common.Address, cancelled 
 	// Track the promoted transactions to broadcast them at once
 	var promoted []*types.Transaction
 
-	// Get a branch of the latest pending context for recheck
-	ctx, write := pool.rechecker.GetContext()
-
 	// Iterate over all accounts and promote any executable transactions
 	for _, addr := range accounts {
 		if isReorgCancelled(reset, cancelled) {
-			queuedPromotedCancelled.Mark(1)
+			queuedPromotedCancelled.Add(context.Background(), 1)
 			return promoted
 		}
 		list := pool.queue[addr]
@@ -1683,39 +1852,41 @@ func (pool *LegacyPool) promoteExecutables(accounts []common.Address, cancelled 
 		var olds types.Transactions
 		if reset != nil {
 			olds = pool.removeOlds(addr, list, Queue)
-			queuedRemovedOld.Mark(int64(len(olds)))
+			queuedRemovedOld.Add(context.Background(), int64(len(olds)))
 		}
 
-		// Drop all transactions that now fail the pools RecheckTxFn
+		// Drop all transactions that now fail RecheckEVM with a non tolerated error
 		//
-		// Note this is happening after the nonce removal above since this
+		// NOTE: this is happening after the nonce removal above since this
 		// check is slower, we would like it to happen on the fewest txs as
 		// possible.
 		recheckStart := time.Now()
 		recheckDrops, _ := list.FilterSorted(func(tx *types.Transaction) bool {
-			newCtx, err := pool.rechecker.RecheckEVM(ctx, tx)
-			if !newCtx.IsZero() {
-				ctx = newCtx
-			}
+			ctx, write := pool.rechecker.GetContext()
+			_, err := pool.rechecker.RecheckEVM(ctx, tx)
+
 			if err == nil && reset == nil {
 				// only write changes back to original context if we are not
 				// running in reset mode, i.e. a new block has not been seen
 				write()
 			}
-			return tolerateRecheckErr(err) != nil
+
+			// do not drop txs if they fail due to a nonce gap error, this is
+			// expected for txs in the queued pool
+			return tolerateNonceGapErr(err) != nil
 		})
 		for _, tx := range recheckDrops {
 			pool.all.Remove(tx.Hash())
 			pool.markTxRemoved(addr, tx, Queue)
 		}
 		log.Trace("Removed queued transactions that failed recheck", "count", len(recheckDrops))
-		queuedRecheckDropMeter.Mark(int64(len(recheckDrops)))
-		queuedRecheckDurationTimer.UpdateSince(recheckStart)
+		queuedRecheckDropMeter.Add(context.Background(), int64(len(recheckDrops)))
+		queuedRecheckDurationTimer.Record(context.Background(), float64(time.Since(recheckStart).Milliseconds()))
 
 		// Gather all executable transactions and promote them
 		listLen := list.Len()
 		readies := list.Ready(pool.pendingNonces.get(addr))
-		queuedNonReadies.Mark(int64(listLen - len(readies)))
+		queuedNonReadies.Add(context.Background(), int64(listLen-len(readies)))
 		for _, tx := range readies {
 			hash := tx.Hash()
 			if pool.promoteTx(addr, hash, tx) {
@@ -1723,7 +1894,7 @@ func (pool *LegacyPool) promoteExecutables(accounts []common.Address, cancelled 
 			}
 		}
 		log.Trace("Promoted queued transactions", "count", len(promoted))
-		queuedGauge.Dec(int64(len(readies)))
+		queuedGauge.Add(context.Background(), -int64(len(readies)))
 
 		// Drop all transactions over the allowed limit
 		caps := list.Cap(int(pool.config.AccountQueue))
@@ -1731,15 +1902,15 @@ func (pool *LegacyPool) promoteExecutables(accounts []common.Address, cancelled 
 			hash := tx.Hash()
 			pool.all.Remove(hash)
 			pool.markTxRemoved(addr, tx, Queue)
-			queueRemovalMetric(RemovalReasonCapExceeded).Mark(1)
+			queueRemovalMetric(RemovalReasonCapExceeded).Add(context.Background(), 1)
 			log.Trace("Removed cap-exceeding queued transaction", "hash", hash)
 		}
-		queuedRateLimitMeter.Mark(int64(len(caps)))
+		queuedRateLimitMeter.Add(context.Background(), int64(len(caps)))
 
 		// Mark all the items dropped as removed
 		totalDropped := len(recheckDrops) + len(caps) + len(olds)
 		pool.priced.Removed(totalDropped)
-		queuedGauge.Dec(int64(totalDropped))
+		queuedGauge.Add(context.Background(), -int64(totalDropped))
 
 		// Delete the entire queue entry if it became empty.
 		if list.Empty() {
@@ -1757,7 +1928,9 @@ func (pool *LegacyPool) promoteExecutables(accounts []common.Address, cancelled 
 // pending limit. The algorithm tries to reduce transaction counts by an approximately
 // equal number for all for accounts with many pending transactions.
 func (pool *LegacyPool) truncatePending() {
-	defer func(t0 time.Time) { pendingTruncateTimer.UpdateSince(t0) }(time.Now())
+	defer func(t0 time.Time) {
+		pendingTruncateTimer.Record(context.Background(), float64(time.Since(t0).Milliseconds()))
+	}(time.Now())
 	pending := uint64(0)
 
 	// Assemble a spam order to penalize large transactors first
@@ -1798,14 +1971,14 @@ func (pool *LegacyPool) truncatePending() {
 						hash := tx.Hash()
 						pool.all.Remove(hash)
 						pool.markTxRemoved(offenders[i], tx, Pending)
-						pendingRemovalMetric(RemovalReasonCapExceeded).Mark(1)
+						pendingRemovalMetric(RemovalReasonCapExceeded).Add(context.Background(), 1)
 
 						// Update the account nonce to the dropped transaction
 						pool.pendingNonces.setIfLower(offenders[i], tx.Nonce())
 						log.Trace("Removed fairness-exceeding pending transaction", "hash", hash)
 					}
 					pool.priced.Removed(len(caps))
-					pendingGauge.Dec(int64(len(caps)))
+					pendingGauge.Add(context.Background(), -int64(len(caps)))
 
 					pending--
 				}
@@ -1825,19 +1998,19 @@ func (pool *LegacyPool) truncatePending() {
 					hash := tx.Hash()
 					pool.all.Remove(hash)
 					pool.markTxRemoved(addr, tx, Pending)
-					pendingRemovalMetric(RemovalReasonCapExceeded).Mark(1)
+					pendingRemovalMetric(RemovalReasonCapExceeded).Add(context.Background(), 1)
 
 					// Update the account nonce to the dropped transaction
 					pool.pendingNonces.setIfLower(addr, tx.Nonce())
 					log.Trace("Removed fairness-exceeding pending transaction", "hash", hash)
 				}
 				pool.priced.Removed(len(caps))
-				pendingGauge.Dec(int64(len(caps)))
+				pendingGauge.Add(context.Background(), -int64(len(caps)))
 				pending--
 			}
 		}
 	}
-	pendingRateLimitMeter.Mark(int64(pendingBeforeCap - pending))
+	pendingRateLimitMeter.Add(context.Background(), int64(pendingBeforeCap-pending))
 }
 
 // truncateQueue drops the oldest transactions in the queue if the pool is above the global queue limit.
@@ -1870,7 +2043,7 @@ func (pool *LegacyPool) truncateQueue() {
 				pool.removeTx(tx.Hash(), true, true, RemovalReasonTruncatedOverflow)
 			}
 			drop -= size
-			queuedRateLimitMeter.Mark(int64(size))
+			queuedRateLimitMeter.Add(context.Background(), int64(size))
 			continue
 		}
 		// Otherwise drop only last few transactions
@@ -1878,7 +2051,7 @@ func (pool *LegacyPool) truncateQueue() {
 		for i := len(txs) - 1; i >= 0 && drop > 0; i-- {
 			pool.removeTx(txs[i].Hash(), true, true, RemovalReasonTruncatedLast)
 			drop--
-			queuedRateLimitMeter.Mark(1)
+			queuedRateLimitMeter.Add(context.Background(), 1)
 		}
 	}
 }
@@ -1891,12 +2064,19 @@ func (pool *LegacyPool) truncateQueue() {
 // is always explicitly triggered by SetBaseFee and it would be unnecessary and wasteful
 // to trigger a re-heap is this function
 func (pool *LegacyPool) demoteUnexecutables(cancelled chan struct{}, reset *txpoolResetRequest) {
-	defer func(t0 time.Time) { demoteTimer.UpdateSince(t0) }(time.Now())
+	defer func(t0 time.Time) {
+		demoteTimer.Record(context.Background(), float64(time.Since(t0).Milliseconds()))
+	}(time.Now())
 
 	// Iterate over all accounts and demote any non-executable transactions
 	for addr, list := range pool.pending {
 		if isReorgCancelled(reset, cancelled) {
-			pendingDemotedCancelled.Mark(1)
+			// NOTE: are explicitly not clearing the toReap lookup since that
+			// may contain txs that have not been rechecked yet and still need
+			// to be reaped that we did not reach during this call since we
+			// cancelled early. we will attempt to reap them next reset after
+			// verification.
+			pendingDemotedCancelled.Add(context.Background(), 1)
 			return
 		}
 
@@ -1904,25 +2084,50 @@ func (pool *LegacyPool) demoteUnexecutables(cancelled chan struct{}, reset *txpo
 		// this account based on what we have seen during the latest block
 		// execution.
 		olds := pool.removeOlds(addr, list, Pending)
-		pendingRemovedOld.Mark(int64(len(olds)))
+		pendingRemovedOld.Add(context.Background(), int64(len(olds)))
 
-		// Drop all transactions that now fail the pools RecheckTxFn
+		// Drop all transactions that now fail RecheckEVM with a non tolerated error
 		//
-		// Note this is happening after the nonce removal above since this
+		// NOTE: this is happening after the nonce removal above since this
 		// check is slower, we would like it to happen on the fewest txs as
 		// possible.
 		recheckStart := time.Now()
-		ctx, write := pool.rechecker.GetContext()
+		var removedPrevious bool
 		recheckDrops, recheckInvalids := list.FilterSorted(func(tx *types.Transaction) bool {
-			newCtx, err := pool.rechecker.RecheckEVM(ctx, tx)
-			if !newCtx.IsZero() {
-				ctx = newCtx
-			}
+			ctx, write := pool.rechecker.GetContext()
+			_, err := pool.rechecker.RecheckEVM(ctx, tx)
 			if err == nil {
-				// always write changes back to the original context
+				// successful recheck, make state changes available to
+				// rechecker's context. we always write state changes here even
+				// if we are resetting since we always want run new rechecks
+				// off of pending state (queued, new inserts, etc).
 				write()
+				return false
 			}
-			return tolerateRecheckErr(err) != nil
+
+			// if we have previously removed a tx in this list during filter,
+			// we want to not remove future txs that fail due to a nonce gap
+			// error, since they will all fail recheck with this due to the
+			// first tx failing and not committing the nonce increment to the
+			// rechecker's context.
+			//
+			// for example say we have a list of txs [tx0, tx1, tx2], and tx0
+			// has failed recheck for some reason (e.g. not enough balance).
+			// this means we have not written the nonce increment for tx0 back
+			// to the rechecker's context, causing the recheck for tx1 to always
+			// fail with a nonce gap error. however, this is expected and ok
+			// for evm txs and we want to keep this tx in the pool, but we want
+			// to demote to back to the queued pool (which will happen via the
+			// nonce invalidation that the filter does).
+			if removedPrevious {
+				return tolerateNonceGapErr(err) != nil
+			}
+
+			// we have not previously removed a tx in this list and recheck
+			// returned an error, always remove this tx and mark that we have
+			// removed a tx in the list.
+			removedPrevious = true
+			return true
 		})
 
 		for _, tx := range recheckDrops {
@@ -1931,9 +2136,9 @@ func (pool *LegacyPool) demoteUnexecutables(cancelled chan struct{}, reset *txpo
 			pool.markTxRemoved(addr, tx, Pending)
 			log.Trace("Removed pending transaction that failed recheck", "hash", hash)
 		}
-		pendingRecheckDropMeter.Mark(int64(len(recheckDrops)))
-		pendingDemotedRecheck.Mark(int64(len(recheckInvalids)))
-		pendingRecheckDurationTimer.UpdateSince(recheckStart)
+		pendingRecheckDropMeter.Add(context.Background(), int64(len(recheckDrops)))
+		pendingDemotedRecheck.Add(context.Background(), int64(len(recheckInvalids)))
+		pendingRecheckDurationTimer.Record(context.Background(), float64(time.Since(recheckStart).Milliseconds()))
 
 		invalids := recheckInvalids
 		for _, tx := range invalids {
@@ -1943,7 +2148,7 @@ func (pool *LegacyPool) demoteUnexecutables(cancelled chan struct{}, reset *txpo
 			// Internal shuffle shouldn't touch the lookup set.
 			pool.enqueueTx(hash, tx, false)
 		}
-		pendingGauge.Dec(int64(len(recheckDrops) + len(invalids) + len(olds)))
+		pendingGauge.Add(context.Background(), -int64(len(recheckDrops)+len(invalids)+len(olds)))
 
 		// Delete the entire pending entry if it became empty.
 		if list.Empty() {
@@ -1951,12 +2156,33 @@ func (pool *LegacyPool) demoteUnexecutables(cancelled chan struct{}, reset *txpo
 			if _, ok := pool.queue[addr]; !ok {
 				pool.reserver.Release(addr)
 			}
-		} else {
-			pool.validPendingTxs.Do(func(store *TxStore) {
-				store.AddTxs(addr, list.Flatten())
-			})
+			continue
+		}
+
+		// list now contains only validated txs (txs that failed recheck have
+		// been dropped, and those now gapped have been moved back to queued)
+		validated := list.Flatten()
+
+		// push validated txs into the validPendingTxs for this height
+		pool.validPendingTxs.Do(func(store *TxStore) { store.AddTxs(addr, validated) })
+
+		// if any of the validated txs are pending reap, reap them now
+		for _, tx := range validated {
+			hash := tx.Hash()
+			if _, ok := pool.toReap[hash]; !ok {
+				// tx does not need deferred reap, continue
+				continue
+			}
+			if err := pool.reapList.PushEVMTx(tx); err != nil {
+				log.Error("failed to push tx pending reap onto reap list", "err", err, "hash", hash)
+			}
+			delete(pool.toReap, hash)
 		}
 	}
+
+	// we have removed txs that we have reaped, but there may be stale entires
+	// in cases where we replace a tx multiple times, clean them up here.
+	pool.toReap = make(map[common.Hash]struct{})
 }
 
 // addressByHeartbeat is an account address tagged with its last activity timestamp.
@@ -2089,7 +2315,7 @@ func (t *lookup) Add(tx *types.Transaction) {
 	defer t.lock.Unlock()
 
 	t.slots += numSlots(tx)
-	slotsGauge.Update(int64(t.slots))
+	slotsGauge.Record(context.Background(), int64(t.slots))
 
 	t.txs[tx.Hash()] = tx
 	t.addAuthorities(tx)
@@ -2107,7 +2333,7 @@ func (t *lookup) Remove(hash common.Hash) {
 	}
 	t.removeAuthorities(tx)
 	t.slots -= numSlots(tx)
-	slotsGauge.Update(int64(t.slots))
+	slotsGauge.Record(context.Background(), int64(t.slots))
 
 	delete(t.txs, hash)
 }
@@ -2223,6 +2449,7 @@ func (pool *LegacyPool) Clear() {
 	pool.pending = make(map[common.Address]*list)
 	pool.queue = make(map[common.Address]*list)
 	pool.pendingNonces = newNoncer(pool.currentState)
+	pool.toReap = make(map[common.Hash]struct{})
 }
 
 // HasPendingAuth returns a flag indicating whether there are pending
@@ -2247,15 +2474,17 @@ func (pool *LegacyPool) markTxPromoted(addr common.Address, tx *types.Transactio
 	_ = pool.tracker.EnteredPending(hash)
 }
 
-// markTxReplaced runs the promotion side-effects for a tx that bypassed the
+// markTxReplaced runs the promotion side effects for a tx that bypassed the
 // queued pool (replaced an existing pending tx at the same nonce). It does
 // **not** include the tx in the valid pending txs set, since replacements
 // must be revalidated by the Rechecker before we rely on them.
 func (pool *LegacyPool) markTxReplaced(_ common.Address, tx *types.Transaction) {
-	if err := pool.reapList.PushEVMTx(tx); err != nil {
-		log.Error("could not push replaced evm tx to ReapList", "err", err, "hash", tx.Hash())
-	}
+	// we are explicitly not adding this tx to the reap list here. this
+	// replacement tx has not been verified via the rechecker. thus we are
+	// deferring the reap to happen only after is has been verified during the
+	// next call to demoteUnexecutables.
 	hash := tx.Hash()
+	pool.toReap[hash] = struct{}{}
 	_ = pool.tracker.ExitedQueued(hash)
 	_ = pool.tracker.EnteredPending(hash)
 }
@@ -2285,10 +2514,10 @@ func (pool *LegacyPool) markTxEnqueued(tx *types.Transaction) {
 	_ = pool.tracker.EnteredQueued(tx.Hash())
 }
 
-// tolerateRecheckErr returns nil if err is an error string that should be
+// tolerateNonceGapErr returns nil if err is an error string that should be
 // ignored from recheck, i.e. we do not want to drop txs from the mempool if we
 // have received specific errors from recheck.
-func tolerateRecheckErr(err error) error {
+func tolerateNonceGapErr(err error) error {
 	// TODO: Fix import cycle if we try and properly match on
 	// errors.Is(mempool.ErrNonceLow)
 	if err != nil && strings.Contains(err.Error(), "tx nonce is higher than account nonce") {
@@ -2297,7 +2526,7 @@ func tolerateRecheckErr(err error) error {
 	return err
 }
 
-func pendingRemovalMetric(reason txpool.RemovalReason) *metrics.Meter {
+func pendingRemovalMetric(reason txpool.RemovalReason) metric.Int64Counter {
 	switch reason {
 	case RemovalReasonLifetime:
 		return pendingRemovedLifetime
@@ -2321,7 +2550,7 @@ func pendingRemovalMetric(reason txpool.RemovalReason) *metrics.Meter {
 	return pendingRemovedUnknown
 }
 
-func queueRemovalMetric(reason txpool.RemovalReason) *metrics.Meter {
+func queueRemovalMetric(reason txpool.RemovalReason) metric.Int64Counter {
 	switch reason {
 	case RemovalReasonLifetime:
 		return queuedRemovedLifetime
